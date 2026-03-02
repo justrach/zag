@@ -20,6 +20,17 @@ Architecture decisions are recorded in [`docs/adr/`](docs/adr/).
 2. Open a discussion before writing a ZEP for significant language changes.
 3. Follow the [ZEP template](docs/zep/ZEP-0000-template.md).
 
+## Building
+
+zag is built from Zig's toolchain. See [Building from Source](https://github.com/ziglang/zig/wiki/Building-Zig-From-Source) for dependencies (CMake, LLVM 19.x).
+
+```
+mkdir build
+cd build
+cmake ..
+make install
+```
+
 ## Origin
 
-zag started as a divergent fork of Zig. The Zig codebase was the launch point; zag owns its own history from here.
+zag started as a divergent fork of Zig (imported from `codeberg.org/ziglang/zig`). The Zig codebase was the launch point; zag owns its own history from here. See [ADR-0001](docs/adr/ADR-0001-divergent-fork.md).
