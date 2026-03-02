@@ -8,273 +8,347 @@
 | Status   | Draft                                                |
 | Type     | Language                                             |
 | Created  | 2026-03-02                                           |
-| Updated  | 2026-03-02                                           |
+| Updated  | 2026-03-02 (rev 2 — thread-first, non-infectious)    |
 | Requires | —                                                    |
 
 ---
 
 ## Abstract
 
-This ZEP defines zag's async model: **structured, colorblind, and explicit**. It adopts Zig's `Io`-as-parameter approach (landed in Zig upstream PR #25592, now in our base), extends it with structured concurrency scopes, and makes cancellation first-class. The result is an async model that AI agents and humans can reason about correctly without hidden scheduler magic.
+This ZEP defines zag's async model. The core position: **async must not infect function signatures**. Not through `async fn`, not through `Io` parameters, not through `suspend`. A function that reads a file looks the same whether it runs on the main thread, in a thread pool, or inside a structured concurrency scope. Concurrency is expressed at the **call site**, not in function types.
+
+zag achieves this with a **fiber-based structured concurrency model**: cheap user-space threads (fibers) scheduled on a work-stealing thread pool, with scope-based lifetime guarantees. Modern hardware has 16–128 cores and abundant memory. We use them.
 
 ---
 
-## Background: A Brief History of Coroutines
+## Background: A Brief History of Coroutines and What Each Era Got Wrong
 
-Understanding why zag's model looks the way it does requires knowing where coroutines came from and what each generation got wrong.
+### 1958–1980: Conway's insight and its neglect
 
-### 1958–1980: Birth and neglect
+Melvin Conway coined "coroutine" in 1958, published formally in 1963 in *Design of a Separable Transition-diagram Compiler*. The insight: program modules that communicate as peers, each treating itself as the master program, with no true master. Coroutines appeared in COBOL compilers and assembly programs, then were largely forgotten as OS threads became mainstream in the 1980s–90s. Games (Lua, Unity) kept them alive.
 
-Melvin Conway coined "coroutine" in 1958 and first published the concept in 1963 in *Design of a Separable Transition-diagram Compiler*. The idea: program modules that communicate as peers — each thinking it is the master program, with no true master. Coroutines appeared in COBOL compilers and assembly programs but were largely forgotten as OS threads became mainstream in the 1980s–90s. Game development (Lua, Unity) kept them alive.
+### 1990s–2010s: Callbacks and their failure
 
-### 1990s–2010s: The callback era and its failure
+OS threads scale poorly past a few thousand. The alternative — event loops with callbacks — is how Node.js, early browser JavaScript, and libevent-based C servers worked. Callbacks produce callback hell: nested, hard to reason about, and nearly impossible for tools (or agents) to analyze statically.
 
-OS threads scale poorly past thousands. The alternative — event loops with callbacks — is how Node.js, early browser JavaScript, and libevent-era C servers worked. Callbacks produce "callback hell": deeply nested, hard to reason about, difficult to debug, and nearly impossible for tools to analyze automatically.
+### 2012–2018: async/await and function coloring
 
-### 2012–2018: async/await arrives
+C# shipped `async`/`await` in 2012. JavaScript followed with Promises (ES6, 2015) and `async`/`await` (ES2017). Python adopted it in 3.5 (2015). The syntax improved, but the model created **function coloring** — named by Bob Nystrom in his 2015 essay *"What Color is Your Function?"*
 
-C# shipped `async`/`await` in 2012. JavaScript followed with Promises (ES6, 2015) and `async`/`await` (ES2017). Python adopted it in 3.5 (2015). The syntax was cleaner, but the underlying model created a new problem: **function coloring**, named by Bob Nystrom in his 2015 essay *"What Color is Your Function?"*.
+In a colored system, every function is either sync or async. You can call sync from async, but not async from sync. This forces:
+- Duplicate APIs (blocking and async variants of the same library)
+- Viral refactoring when a function deep in a call stack needs to become async
+- Cognitive overhead for human readers
+- **Structural blindness for AI agents** — an agent must trace color through an entire call graph to determine whether a function call is safe
 
-In a colored system, every function is either sync (white) or async (red). You can call white from red, but not red from white — without special handling. This forces duplicate APIs (blocking and async variants of the same library), viral refactoring when a function deep in a call stack needs to become async, and cognitive overhead for anyone reading the code.
+### The survey: what every language did, and what it cost
 
-### Language-by-language survey
+| Language      | Model                      | Stackful? | Infection?       | Key cost                                |
+|---------------|----------------------------|-----------|------------------|-----------------------------------------|
+| Go            | Goroutines (M:N scheduler) | Yes       | None             | GC required; large runtime              |
+| Rust          | Poll-based Futures         | No        | `async fn` viral | Hostile to read; complex executor model |
+| Python        | asyncio event loop         | No        | `async def` viral | Single-threaded; GIL                   |
+| JavaScript    | Promises + event loop      | No        | Viral            | Single-threaded                         |
+| Kotlin        | Structured concurrency     | No        | `suspend` viral  | JVM required                            |
+| C++20         | Stackless coroutines       | No        | `co_await` viral | No stdlib; extremely verbose            |
+| Zig (old)     | Colorblind async           | No        | None (almost)    | Leaked through fn pointers; removed     |
+| Zig (new)     | `Io` parameter             | No        | `Io` viral       | `Io` must thread through all I/O callers|
+| Java Loom     | Virtual threads            | Yes       | **None**         | JVM; GC                                 |
+| Erlang        | Actors + lightweight procs | Yes       | **None**         | Immutable data model; different paradigm|
 
-| Language   | Model               | Stackful? | Coloring?  | Runtime?  | Key strength            | Key weakness                     |
-|------------|---------------------|-----------|------------|-----------|-------------------------|----------------------------------|
-| **Go**     | Goroutines (M:N)    | Yes       | No         | Yes (GC)  | Simple to write         | Large per-goroutine stack, GC    |
-| **Rust**   | Poll-based Futures  | No        | Yes        | No        | Zero-cost, no runtime   | Complex, viral, hard to read     |
-| **Python** | asyncio event loop  | No        | Yes        | Yes       | Readable                | Single-threaded, GIL             |
-| **JS**     | Promises + event loop | No      | Yes        | Yes       | Ubiquitous              | Colored, single-threaded         |
-| **Kotlin** | Structured concurrency | No     | Yes (suspend) | Yes    | Scope safety, cancellation | JVM overhead                  |
-| **C++20**  | Stackless coroutines | No       | Yes        | No        | Low-level control       | Extremely verbose, no stdlib     |
-| **Zig (old)** | Colorblind async | No        | No         | No        | Single source, sync+async | Leaked through fn pointers      |
-| **Zig (new)** | `Io` interface   | No        | No         | No        | Colorblind, no keywords  | Structured concurrency missing  |
+### The Io parameter is still infection
 
-### What Zig's new model gets right (and what it still lacks)
+Zig's new async model (PR #25592, in our fork base) routes I/O through an `Io` interface parameter. This eliminates `async fn` coloring, but it introduces **parameter coloring**: any function that does I/O must accept an `Io` argument and thread it through every callee that also does I/O. Change a leaf function to need I/O? Refactor its entire call chain.
 
-Zig's 0.15/0.16 async (PR #25592) threads an `Io` interface through functions that do I/O. Different `Io` implementations — `std.Io.Threaded`, `std.Io.Evented` — provide different execution models. The same source code works in both. `io.async()` spawns a future; `future.await(io)` resolves it. No `async`/`await` keywords on functions, no colored function types.
+From an agent-authorship perspective this is strictly better than `async fn` coloring (the infection is at least visible as a parameter, not a type modifier), but it is still infection. An agent writing a utility function cannot know whether to add `Io` without understanding all possible callers.
 
-What it does not yet have:
-- **Structured concurrency**: futures can be created but there is no scope that guarantees all futures are awaited before the scope exits.
-- **Cancellation as a first-class concept**: a cancelled future must still be awaited; there is no mechanism to propagate cancellation through a tree of tasks automatically.
-- **Error propagation across task boundaries**: if one parallel task fails, coordinating cleanup of sibling tasks requires manual bookkeeping.
+### What Go and Java Loom got right
 
-zag's model addresses all three.
+Go's goroutines and Java's virtual threads share one key property: **functions are just functions**. `go func()` spawns concurrently; the function itself is unchanged. A function written for synchronous use runs unchanged in a goroutine. The scheduler handles preemption and blocking transparently.
+
+The cost in both cases is a garbage collector. zag does not have one. But the insight — **concurrency at the call site, not in the function type** — is correct and achievable without GC.
 
 ---
 
 ## Motivation
 
-zag needs a stable async story for two reasons:
+### Hardware reality in 2026
 
-1. **Practical**: zag is a systems language. I/O-bound programs — servers, CLIs, build tools — are primary use cases. Without async, they either block or spawn OS threads for everything.
+A laptop ships with 10–24 cores. A server has 64–256. Memory is cheap. The dominant I/O interfaces (io_uring, IOCP, kqueue) are designed for high concurrency. The assumption that underpinned stackless async — *"we can't afford a stack per concurrent task"* — is stale. Modern fiber libraries (like Boost.Context, Google's Fibers, or Go's own goroutine stacks) start stacks at 2–8KB and grow them as needed. Thousands of fibers are practical on any modern machine.
 
-2. **Agent authorship**: AI agents generate async code more reliably when the model is consistent and explicit. A colored system forces agents to track function colors through a call graph. A system with implicit spawning and hidden cancellation produces agent-generated code that leaks tasks. zag's model must be auditable: an agent reading a function should be able to determine its concurrency behavior from local context alone.
+### Agent authorship requires local reasoning
+
+An AI agent writing zag code must be able to answer: *"Is this function safe to call from here?"* In a colored system, the answer depends on the calling context — which may be in a different file. In a non-infected model, the answer is always yes. Local reasoning is sufficient.
+
+The same property matters for human reviewers: a function's signature tells you everything about its behavior. No hidden async contracts.
+
+### Structured concurrency is still the right safety model
+
+Go's goroutines can leak — a goroutine spawned without a `sync.WaitGroup` or `context.Context` can outlive its parent, causing resource leaks and data races. zag adopts Kotlin's structural insight: **every spawned task is scoped to a lexical block**. The scope guarantees all tasks complete (or are cancelled) before the block exits.
 
 ---
 
 ## Non-Goals
 
-- zag does not provide a built-in runtime or event loop. `Io` is always a parameter.
-- zag does not implement Go-style goroutines with a managed scheduler and GC.
-- zag does not provide coroutine-based generators (`yield`) in this ZEP. That is a separate proposal.
-- This ZEP does not define the `std.Io.Evented` implementation. That is a follow-on.
+- zag does not provide actors, channels, or message-passing primitives in this ZEP. Those are separate proposals.
+- zag does not provide an event loop in this ZEP. Fiber scheduling is the foundation; evented I/O is built on top of it.
+- This ZEP does not define generator coroutines (`yield`). Separate proposal.
+- zag does not require a garbage collector.
 
 ---
 
 ## Specification
 
-### 1. The `Io` interface (inherited from Zig, stabilized by zag)
+### 1. Fibers
 
-Any function that performs I/O receives an `Io` parameter. This is the only coloring in zag: a function either takes `Io` or it does not, and that is visible in its signature.
+A **fiber** is a user-space thread with its own stack, scheduled cooperatively by the zag runtime on top of OS threads. Fibers are:
 
-```zig
-// sync-capable function: takes Io, works under any Io implementation
-fn readFile(io: Io, path: []const u8) ![]u8 { ... }
+- **Cheap**: initial stack size 8KB, grows on demand up to a configurable limit (default 1MB).
+- **Opaque**: calling code does not know whether it is running on a fiber or an OS thread.
+- **Blocking-transparent**: when a fiber blocks on I/O, the scheduler parks it and runs another fiber on the same OS thread. The fiber's code sees ordinary blocking calls.
 
-// no-Io function: provably synchronous and I/O-free
-fn parseHeader(data: []const u8) !Header { ... }
-```
+Fibers are an implementation detail. The language surface is **scopes** and **tasks**.
 
-`Io` is not a keyword type. It is an interface (a comptime-known vtable) defined in the standard library. User code may implement custom `Io` backends for testing, simulation, or novel execution models.
+### 2. The Thread Pool
 
-### 2. Futures
+zag's runtime maintains a **work-stealing thread pool** with one OS thread per logical CPU core by default (configurable). All fibers run on this pool. No goroutine-style M:N with a custom scheduler — the pool is the scheduler.
 
-`io.async(func, args)` spawns a task and returns a `Future(T)`. A `Future(T)` is a resource — it must be awaited or explicitly cancelled before it goes out of scope.
+The pool is initialized at program start. Its size is controlled by:
 
 ```zig
-var f = io.async(readFile, .{ io, "data.bin" });
-const data = try f.await(io);
-```
-
-`Future(T)` is not heap-allocated by default. Under `std.Io.Threaded`, the future encapsulates a thread handle. Under `std.Io.Evented`, it is a suspended coroutine frame on a pool.
-
-### 3. Structured Task Groups (zag addition)
-
-The core zag extension: `io.group()` returns a `TaskGroup` scoped to a block. All futures spawned through the group are guaranteed to be resolved (awaited or cancelled) when the group scope exits — whether by normal return, early return, or error unwinding.
-
-```zig
-var group = io.group();
-defer group.deinit(io); // awaits or cancels all outstanding futures
-
-var f_a = group.async(io, saveFile, .{ io, data, "a.bin" });
-var f_b = group.async(io, saveFile, .{ io, data, "b.bin" });
-
-// Both futures are awaited here; if either errors, both are resolved
-// before the error propagates.
-try group.awaitAll(io);
-```
-
-`defer group.deinit(io)` is the structured concurrency guarantee. It is idiomatic to pair every `io.group()` with a `defer group.deinit(io)` on the next line, enforced by a compiler lint.
-
-**Failure semantics:**
-
-When one task in a group errors, `awaitAll` cancels the remaining tasks, collects the first error, and returns it. Remaining task errors after cancellation are discarded (logged in debug builds). This matches Kotlin's structured concurrency semantics.
-
-```zig
-var group = io.group();
-defer group.deinit(io);
-
-var f_a = group.async(io, fetchUrl, .{ io, url_a });
-var f_b = group.async(io, fetchUrl, .{ io, url_b });
-
-// If f_a errors, f_b is cancelled. The error from f_a is returned.
-const results = try group.awaitAll(io);
-```
-
-### 4. Cancellation
-
-Cancellation is modelled as an error: `error.Cancelled`. Any function that takes `Io` may receive a cancelled `Io` and must propagate the cancellation by returning `error.Cancelled` at the next suspension point.
-
-```zig
-fn fetchUrl(io: Io, url: []const u8) ![]u8 {
-    const conn = try io.tcpConnect(url);  // returns error.Cancelled if io is cancelled
-    const data = try io.read(conn);        // same
-    return data;
+pub fn main() void {
+    zag.runtime.init(.{ .threads = .auto }); // default: num_cpus
+    defer zag.runtime.deinit();
+    // ...
 }
 ```
 
-A function does not need to check for cancellation explicitly. The `Io` methods handle it. This means:
-- Cancellation is cooperative.
-- Pure compute functions (no `Io` calls) are not cancellable — by design.
-- Cancellation is not a signal; it is a structured error path that follows normal error unwinding.
+Or via environment variable: `ZAG_THREADS=8 ./myprogram`.
 
-### 5. Timeout
+### 3. `zag.Task(T)` — spawning at the call site
 
-Timeouts are implemented as cancellation with a deadline, not as a separate mechanism.
+`zag.spawn(func, args)` spawns `func` as a fiber on the thread pool and returns a `Task(T)`. The function being spawned is **unchanged** — it has no special signature.
 
 ```zig
-var timed_io = io.withDeadline(std.time.nanoTimestamp() + std.time.ns_per_s * 5);
-const data = try fetchUrl(timed_io, url); // errors with Cancelled after 5s
+fn readFile(path: []const u8, alloc: Allocator) ![]u8 {
+    // ordinary blocking code — no Io parameter, no async keyword
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    return f.readToEndAlloc(alloc, 1 << 20);
+}
+
+// At the call site, concurrency is explicit:
+const task = zag.spawn(readFile, .{ "data.bin", alloc });
+const data = try task.join(); // blocks the calling fiber until done
 ```
 
-`io.withDeadline` returns a new `Io` that wraps the original and cancels at the deadline. It is a value type, not heap-allocated.
+`task.join()` blocks the **fiber**, not the OS thread. The OS thread is free to run other fibers while waiting.
 
-### 6. No hidden spawning
+### 4. `zag.Scope` — structured concurrency
 
-`io.async()` is the only way to spawn a concurrent task. There is no implicit parallelism, no work-stealing from bare function calls, no "green thread per request" model. Concurrency is always visible at the call site.
-
-### 7. Executor implementations (standard library)
-
-| Implementation          | Description                                          |
-|-------------------------|------------------------------------------------------|
-| `std.Io.Blocking`       | All operations block the calling thread. No concurrency. Default for CLI tools. |
-| `std.Io.Threaded`       | Thread pool. `io.async()` submits to the pool. Good for CPU-bound tasks mixed with I/O. |
-| `std.Io.Evented`        | Event loop (io_uring on Linux, kqueue on macOS, IOCP on Windows). WIP. |
-| `std.Io.Test`           | Deterministic single-threaded executor for testing. |
-
-All implementations satisfy the same `Io` interface. Swapping them requires changing one line at program startup.
-
----
-
-## Examples
-
-### Basic parallel I/O
+`zag.Scope` is the structured concurrency primitive. Every task spawned through a scope is guaranteed to complete (or be cancelled) before `scope.wait()` returns. `defer scope.wait()` is the idiomatic pattern.
 
 ```zig
-const std = @import("std");
+fn saveBackups(data: []const u8, alloc: Allocator) !void {
+    var scope = zag.Scope.init();
+    defer scope.wait(); // waits for all tasks; cancels on error
 
-fn saveData(io: Io, alloc: Allocator, data: []const u8) !void {
-    var group = io.group();
-    defer group.deinit(io);
-
-    _ = group.async(io, saveFile, .{ io, alloc, data, "backup_a.bin" });
-    _ = group.async(io, saveFile, .{ io, alloc, data, "backup_b.bin" });
-
-    try group.awaitAll(io);
+    scope.spawn(writeFile, .{ "backup_a.bin", data, alloc });
+    scope.spawn(writeFile, .{ "backup_b.bin", data, alloc });
+    scope.spawn(writeFile, .{ "backup_c.bin", data, alloc });
+    // all three run in parallel; scope.wait() blocks until all finish
 }
 ```
 
-### HTTP server handler (conceptual)
+**No `Io` parameter. No `async` keyword. `writeFile` is an ordinary function.**
+
+#### Failure semantics
+
+If any task in the scope returns an error:
+1. The scope cancels all remaining tasks (by setting a cancellation flag they can check at yield points).
+2. `scope.wait()` collects the first error and returns it.
+3. Subsequent errors from cancelled tasks are discarded.
 
 ```zig
-fn handleRequest(io: Io, alloc: Allocator, req: Request) !Response {
-    var group = io.group();
-    defer group.deinit(io);
+fn fetchAll(urls: []const []u8, alloc: Allocator) ![][]u8 {
+    var scope = zag.Scope.init();
+    defer scope.wait();
 
-    // Fetch user and permissions in parallel
-    var f_user = group.async(io, db.getUser, .{ io, alloc, req.user_id });
-    var f_perms = group.async(io, db.getPermissions, .{ io, alloc, req.user_id });
+    var tasks = try alloc.alloc(zag.Task([]u8), urls.len);
+    for (urls, 0..) |url, i| {
+        tasks[i] = scope.spawn(fetch, .{ url, alloc });
+    }
 
-    const results = try group.awaitAll(io);
-    const user = results.get(f_user);
-    const perms = results.get(f_perms);
-
-    return buildResponse(user, perms);
+    var results = try alloc.alloc([]u8, urls.len);
+    for (tasks, 0..) |task, i| {
+        results[i] = try task.join();
+    }
+    return results;
 }
 ```
 
-### Testing with deterministic Io
+### 5. Cancellation
+
+Cancellation is cooperative and explicit. A fiber checks for cancellation at **yield points** — blocking calls that park the fiber. There is no forced termination.
+
+Functions opt into cancellation checking with `zag.checkCancel()`:
 
 ```zig
-test "saveData writes two files" {
-    var test_io = std.Io.Test.init();
-    defer test_io.deinit();
-
-    try saveData(test_io.io(), alloc, "hello");
-
-    try std.testing.expect(test_io.fileExists("backup_a.bin"));
-    try std.testing.expect(test_io.fileExists("backup_b.bin"));
+fn processLargeFile(path: []const u8, alloc: Allocator) !Result {
+    const data = try readFile(path, alloc); // yield point — auto-checks cancel
+    for (chunks(data)) |chunk| {
+        try zag.checkCancel(); // explicit check in CPU-bound loop
+        processChunk(chunk);
+    }
+    return summarize(data);
 }
 ```
 
-### Timeout
+`zag.checkCancel()` returns `error.Cancelled` if the enclosing scope has been cancelled. It does not require any parameter — the runtime maintains the cancellation state per-fiber on the fiber's stack frame.
+
+**No parameter threading. No infection.**
+
+### 6. Timeouts
+
+Timeouts wrap a scope:
 
 ```zig
-fn fetchWithTimeout(io: Io, url: []const u8) ![]u8 {
-    var timed = io.withDeadline(std.time.nanoTimestamp() + 10 * std.time.ns_per_s);
-    return fetchUrl(timed, url) catch |err| switch (err) {
+fn fetchWithTimeout(url: []const u8, alloc: Allocator) ![]u8 {
+    var scope = zag.Scope.initWithTimeout(5 * std.time.ns_per_s);
+    defer scope.wait();
+
+    const task = scope.spawn(fetch, .{ url, alloc });
+    return task.join() catch |err| switch (err) {
         error.Cancelled => error.Timeout,
         else => err,
     };
 }
 ```
 
+### 7. Synchronization primitives
+
+zag provides fiber-aware versions of standard synchronization primitives. Blocking on these parks the fiber, not the OS thread:
+
+| Primitive          | Notes                                          |
+|--------------------|------------------------------------------------|
+| `zag.Mutex`        | Fiber-aware mutex. Parked fibers don't block OS threads. |
+| `zag.RwLock`       | Fiber-aware read-write lock.                   |
+| `zag.Semaphore`    | Counting semaphore.                            |
+| `zag.WaitGroup`    | Wait for N tasks (lower-level than Scope).     |
+| `zag.Channel(T)`   | Bounded MPMC channel. Blocks fibers on full/empty. |
+
+### 8. Blocking legacy code
+
+For code that cannot yield (e.g., a C library call that blocks an OS thread), zag provides `zag.blockingCall`:
+
+```zig
+// Runs func on a dedicated blocking thread so it doesn't starve the pool
+const result = try zag.blockingCall(legacyCFunction, .{arg});
+```
+
+This is an escape hatch, not the default. It spawns an extra OS thread for the duration of the call.
+
+---
+
+## Examples
+
+### Parallel file saves (no async, no Io)
+
+```zig
+fn saveBackups(data: []const u8, alloc: Allocator) !void {
+    var scope = zag.Scope.init();
+    defer scope.wait();
+
+    scope.spawn(writeFile, .{ "backup_a.bin", data, alloc });
+    scope.spawn(writeFile, .{ "backup_b.bin", data, alloc });
+}
+```
+
+### Fan-out HTTP requests
+
+```zig
+fn fetchAll(urls: []const []u8, alloc: Allocator) ![]Response {
+    var scope = zag.Scope.init();
+    defer scope.wait();
+
+    var tasks = try alloc.alloc(zag.Task(Response), urls.len);
+    for (urls, 0..) |url, i| tasks[i] = scope.spawn(fetch, .{ url, alloc });
+
+    var out = try alloc.alloc(Response, urls.len);
+    for (tasks, 0..) |t, i| out[i] = try t.join();
+    return out;
+}
+```
+
+### CPU-bound parallel work
+
+```zig
+fn parallelMap(
+    items: []Item,
+    alloc: Allocator,
+    comptime func: fn (Item, Allocator) !Result,
+) ![]Result {
+    var scope = zag.Scope.init();
+    defer scope.wait();
+
+    var tasks = try alloc.alloc(zag.Task(Result), items.len);
+    for (items, 0..) |item, i| tasks[i] = scope.spawn(func, .{ item, alloc });
+
+    var out = try alloc.alloc(Result, items.len);
+    for (tasks, 0..) |t, i| out[i] = try t.join();
+    return out;
+}
+```
+
+### Testing — no special test executor needed
+
+```zig
+test "parallel saves" {
+    // Works in test runner without any special async test setup.
+    // zag.runtime is initialized by the test harness.
+    var scope = zag.Scope.init();
+    defer scope.wait();
+
+    scope.spawn(writeFile, .{ "a.bin", "hello", testing.allocator });
+    scope.spawn(writeFile, .{ "b.bin", "world", testing.allocator });
+}
+```
+
+---
+
+## Comparison: fiber model vs Io parameter
+
+| Property                        | Io parameter (Zig upstream)     | Fiber + Scope (this ZEP)         |
+|---------------------------------|---------------------------------|----------------------------------|
+| Function signature change?      | Yes — add `Io` param            | **No**                           |
+| Viral through call chain?       | Yes                             | **No**                           |
+| Agent local reasoning?          | Partial — must trace `Io`       | **Full — functions are functions** |
+| Stack per task?                 | No (stackless)                  | Yes — 8KB min, grows as needed   |
+| Works without runtime?          | Yes                             | No — pool must be initialized    |
+| Embedded / no-alloc targets?    | Yes                             | Constrained — fibers need memory |
+| I/O abstraction for testing?    | Yes — swap `Io` impl            | `zag.Scope` + mock functions     |
+| Cancellation threading?         | Via `Io` parameter              | Via runtime fiber state (no param)|
+| Blocking C interop?             | Opaque to `Io`                  | `zag.blockingCall` escape hatch  |
+
 ---
 
 ## Backwards Compatibility
 
-- [ ] **Breaking change.**
+- [ ] **Breaking change from ZEP-0002 rev 1**: the `Io`-as-parameter API is not adopted. Code written for Zig's `std.Io` interface will not compile without removing the `Io` parameters.
+- The old stage1 Zig async keywords are already absent from our fork base. No regression there.
 
-Zig programs using the old stage1 async/await keywords (`async fn`, `await`, `suspend`, `resume`) will not compile — those keywords were already removed in Zig 0.11 and are not present in our fork base.
-
-Zig programs using the new `io.async()` / `future.await(io)` pattern (Zig 0.15+) are compatible with this ZEP's `Future` API. `TaskGroup` is a zag addition with no Zig equivalent to conflict with.
-
-Migration from raw `Future` to `TaskGroup`:
+Migration from Zig's `Io` pattern:
 
 ```zig
-// Before (raw futures, manual bookkeeping):
-var f_a = io.async(work, .{io, a});
-var f_b = io.async(work, .{io, b});
-const ra = try f_a.await(io);
-const rb = try f_b.await(io);
+// Zig upstream:
+fn readFile(io: Io, path: []const u8, alloc: Allocator) ![]u8 { ... }
+const task = io.async(readFile, .{ io, path, alloc });
+const data = try task.await(io);
 
-// After (TaskGroup, structured):
-var group = io.group();
-defer group.deinit(io);
-var f_a = group.async(io, work, .{io, a});
-var f_b = group.async(io, work, .{io, b});
-const results = try group.awaitAll(io);
+// zag:
+fn readFile(path: []const u8, alloc: Allocator) ![]u8 { ... }
+const task = zag.spawn(readFile, .{ path, alloc });
+const data = try task.join();
 ```
 
 ---
@@ -283,40 +357,43 @@ const results = try group.awaitAll(io);
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
-| `TaskGroup` lifetime bugs (use after deinit) | Medium | High | Compiler lint: warn if group escapes its scope |
-| Cancellation not propagated through third-party code | Medium | Medium | Document: code that does not take `Io` cannot be cancelled by design |
-| `defer group.deinit(io)` forgotten | High | High | Compiler lint: `TaskGroup` without `defer deinit` in same scope is a warning |
-| `std.Io.Evented` being WIP delays adoption | High | Low | `std.Io.Threaded` is fully functional; Evented is a perf optimization |
-| Executor swap not obvious to newcomers | Medium | Low | `zag new` scaffold always generates `main` with explicit Io setup |
+| Fiber stack overflow on deep recursion | Medium | High | Stack growth by default; configurable limit; compiler can warn on recursive fns |
+| Forgetting `defer scope.wait()` — tasks leak | High | High | Compiler lint: `Scope` without `defer wait()` in same block is a warning |
+| Pool starvation from blocking C calls | Medium | Medium | `zag.blockingCall` spawns extra OS thread; document the pattern |
+| Embedded targets (no allocator, no runtime) | High | Medium | Scope: single-threaded fallback mode (`ZAG_THREADS=1` runs fibers sequentially on main thread) |
+| Data races on shared mutable state | Medium | High | zag's existing ownership model + `zag.Mutex`; no GC race detector, but `ThreadSanitizer` compatible |
+| High fiber count memory pressure | Low | Medium | Fibers start at 8KB; 10,000 fibers = 80MB — acceptable on modern hardware |
 
 ---
 
 ## Testing and Validation Plan
 
-- [ ] `std.Io.Test` unit tests for all standard library async functions
-- [ ] Compile-time tests: `TaskGroup` escaping scope → compile error
-- [ ] Integration tests: parallel file I/O, parallel HTTP fetches (mock)
-- [ ] Cancellation propagation tests: deadline fires, all tasks unwind correctly
-- [ ] Fuzz test: arbitrary task failure order → no leaked tasks
-- [ ] Benchmark: `std.Io.Threaded` vs `std.Io.Blocking` for N parallel reads
+- [ ] Unit tests: `zag.Scope` correctly waits for all tasks
+- [ ] Unit tests: failure in one task cancels siblings, error propagates
+- [ ] Unit tests: `zag.checkCancel()` returns `error.Cancelled` after scope cancellation
+- [ ] Unit tests: timeout cancels scope after deadline
+- [ ] Stress test: 100,000 fibers on 8-core machine — no deadlock, no leak
+- [ ] Benchmark: fiber spawn/join overhead vs OS thread spawn
+- [ ] Benchmark: parallel file I/O throughput vs single-threaded
+- [ ] Compile-time test: `Scope` without `defer wait()` → warning
 
 ---
 
 ## Implementation Notes
 
-1. `Io` is already an interface in the Zig upstream we forked. zag stabilizes its API (Zig may still change it; zag will not without a ZEP).
-2. `TaskGroup` is implemented in `std/io/group.zig`. It holds an array list of `AnyFuture` (type-erased futures).
-3. The "compiler lint" for forgotten `defer group.deinit` is implemented as a semantic analysis pass: if a `TaskGroup` value goes out of scope without a call to `deinit` in the same scope, emit a warning.
-4. `error.Cancelled` is added to the standard error set. It is handled identically to other errors by the type system.
-5. `io.withDeadline` returns a stack-allocated `DeadlineIo` struct that wraps `Io` and checks the deadline before delegating each operation.
+1. **Fiber implementation**: use platform `ucontext_t` (POSIX) or `SwitchToFiber` (Windows) for context switching, or a custom assembly implementation (like Go's runtime) for performance. The fiber scheduler is in `lib/zag/runtime/fiber.zig`.
+2. **Work-stealing pool**: each OS thread has a local run queue (deque). Idle threads steal from the back of other threads' deques. Standard work-stealing algorithm (Chase-Lev deque).
+3. **Cancellation state**: stored in a single `std.atomic.Value(bool)` on the fiber's stack frame header. `zag.checkCancel()` reads it. No parameter threading.
+4. **`zag.spawn` vs `scope.spawn`**: `zag.spawn` creates a detached task (manual `join()` required). `scope.spawn` registers the task with the scope. Both share the same fiber runtime.
+5. **Single-threaded fallback**: when `ZAG_THREADS=1` or on embedded targets, `scope.spawn` runs tasks sequentially inline. No fibers, no pool. The API surface is identical.
 
 ---
 
 ## Rollout / Migration Strategy
 
-1. **Phase 1** (this ZEP): `std.Io.Blocking`, `std.Io.Threaded`, `std.Io.Test`, `TaskGroup`, cancellation, timeout. Stable API, no breaking changes to stabilized APIs after this point without a new ZEP.
-2. **Phase 2** (follow-on ZEP): `std.Io.Evented` — io_uring/kqueue/IOCP backend. Io-compatible; no source changes required.
-3. **Phase 3** (follow-on ZEP): `zag fix async` migration tool for any upstream Zig async patterns that differ.
+1. **Phase 1** (this ZEP): fiber runtime, work-stealing pool, `zag.Task`, `zag.Scope`, `zag.checkCancel`, timeout, `zag.Mutex`/`RwLock`/`Semaphore`/`Channel`.
+2. **Phase 2** (follow-on ZEP): `std.Io.Evented` — io_uring/kqueue/IOCP integration. Fibers block on I/O without blocking OS threads.
+3. **Phase 3** (follow-on ZEP): `zag fix async` migration tool for Zig `Io`-parameter code.
 
 ---
 
@@ -324,36 +401,41 @@ const results = try group.awaitAll(io);
 
 | Alternative | Reason rejected |
 |-------------|-----------------|
-| Go-style goroutines | Requires GC for stack management; contradicts zag's no-hidden-allocations principle |
-| Rust-style `async fn` / poll-based futures | Function coloring; viral in call graphs; hostile to AI agent authorship (agents must track colors across files) |
-| Kotlin structured concurrency (coroutine scopes) | Good model, but requires a JVM-style runtime and suspend keyword coloring |
-| Raw `io.async()` without TaskGroup (pure Zig approach) | Does not guarantee task cleanup on error paths; AI-generated code reliably leaks tasks without scope enforcement |
-| Green threads / stackful coroutines | Large per-coroutine memory cost; less predictable performance; not composable with the no-hidden-allocation principle |
-| Explicit event loop in user code | Pushes too much boilerplate to users; not ergonomic for agent-generated code |
+| `Io` parameter (Zig upstream) | Still infectious — threads through every I/O caller. Rejected in favor of zero-infection fiber model. |
+| `async fn` / stackless coroutines (Rust, JS) | Viral, hostile to agent authorship. Rejected. |
+| Go-style goroutines | Correct model, but requires GC for stack management. zag has no GC. |
+| Pure thread-per-task (no fibers) | OS threads cost 1–8MB stack each. 10,000 tasks = 10–80GB. Not practical. Fibers start at 8KB. |
+| Actor model (Erlang) | Requires immutable-by-default data model. Too large a departure from Zig's semantics. |
+| No async at all (blocking I/O, explicit thread management) | Leaves parallel I/O to users; they will reinvent fibers badly. |
 
 ---
 
 ## Open Questions
 
-- [ ] Should `group.awaitAll` return a typed results struct or individual `try result_a`, `try result_b` calls? The current proposal uses a results handle but the API ergonomics need prototyping.
-- [ ] Should `error.Cancelled` be a distinct error type (`CancelledError`) rather than a member of the common error set, to prevent accidental catching in catch-all handlers?
-- [ ] `std.Io.Evented`: what is the API for integrating with platform-native event loops (e.g., macOS `CFRunLoop`, Windows message pump)? This affects GUI application support.
+- [ ] Should `zag.spawn` (detached) be in the language at all, or should all spawning go through `Scope`? Detached tasks can leak if `join()` is never called.
+- [ ] Stack growth: use `mmap` guard pages for overflow detection, or explicit stack-size hints on `spawn`?
+- [ ] Should `zag.Channel(T)` be in scope for Phase 1, or deferred to the actor/message-passing ZEP?
+- [ ] How does the fiber runtime interact with `comptime`? (It doesn't — `comptime` is single-threaded by definition. Clarify in spec.)
 
 ---
 
 ## Done Criteria
 
-- [ ] `std.Io.Blocking`, `std.Io.Threaded`, `std.Io.Test` implemented and tested.
-- [ ] `TaskGroup` implemented with compiler lint for missing `defer deinit`.
-- [ ] `error.Cancelled` in standard error set; `io.withDeadline` implemented.
-- [ ] All standard library I/O functions accept `Io` parameter.
-- [ ] Language reference section on async updated.
+- [ ] Fiber runtime implemented and tested on Linux, macOS, Windows.
+- [ ] Work-stealing thread pool implemented.
+- [ ] `zag.Task`, `zag.Scope`, `zag.checkCancel`, `zag.blockingCall` implemented.
+- [ ] Compiler lint for `Scope` without `defer wait()`.
+- [ ] Synchronization primitives: `Mutex`, `RwLock`, `Semaphore`, `WaitGroup`, `Channel`.
+- [ ] Single-threaded fallback (`ZAG_THREADS=1`) working.
+- [ ] Benchmark report published.
+- [ ] Language reference updated.
 - [ ] This ZEP status updated to `Final`.
 
 ---
 
 ## Status History
 
-| Date       | Status | Note                                             | Council votes |
-|------------|--------|--------------------------------------------------|---------------|
-| 2026-03-02 | Draft  | Initial draft — research from coroutine history  | —             |
+| Date       | Status | Note                                                        | Council votes |
+|------------|--------|-------------------------------------------------------------|---------------|
+| 2026-03-02 | Draft  | Initial draft — Io-parameter model (rev 1)                  | —             |
+| 2026-03-02 | Draft  | Rev 2 — fiber-first, zero-infection; Io parameter rejected  | —             |
