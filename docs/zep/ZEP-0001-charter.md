@@ -16,6 +16,8 @@
 
 This ZEP establishes zag's identity, goals, and the process by which the language evolves. It is the founding document of the project.
 
+**zag is built by AI, for AI** — and for the humans who work alongside them.
+
 ## What zag is
 
 zag is a systems programming language that started as a divergent fork of Zig. It inherits Zig's core philosophy:
@@ -25,15 +27,30 @@ zag is a systems programming language that started as a divergent fork of Zig. I
 - **Errors are values.** No exceptions; error handling is part of the type system.
 - **Comptime over macros.** Metaprogramming through compile-time execution, not a separate macro language.
 
+## Built by AI, for AI
+
+zag is designed from the ground up to be a language that AI agents can read, reason about, and write correctly — not as a secondary concern, but as a primary design goal.
+
+This means:
+
+- **Unambiguous grammar.** Every construct parses one way. No context-sensitive rules, no operator precedence surprises.
+- **Explicit semantics.** What you see in source code is what happens at runtime. Agents don't need to model invisible compiler magic.
+- **Machine-readable toolchain.** The compiler, build system, and standard library expose structured, stable interfaces that agents can call programmatically.
+- **Documented evolution.** Every language change goes through a ZEP. An agent reading the ZEP history can reconstruct why the language is the way it is.
+
+The practical consequence: zag code written by an AI agent should be indistinguishable from code written by a skilled human. That is the bar.
+
+## Co-developed by humans and AI
+
+zag is not built *for* AI at the expense of humans. It is built *with* AI, as a co-author from day one.
+
+- Human and AI contributors propose, review, and implement features together through the ZEP process. A ZEP stands or falls on its reasoning, not on who wrote it.
+- Because AI agents can implement accepted ZEPs rapidly, the gap between "accepted proposal" and "shipped feature" shrinks significantly. We can afford to be more deliberate about design because implementation velocity is high.
+- The language and toolchain are kept legible to humans. If a human can't read it, an agent shouldn't write it.
+
 ## What zag is becoming
 
-zag evolves these foundations toward an **agent-driven** development model — co-developed by humans and AI agents as equal contributors:
-
-- AI agents are first-class *authors* of zag code. The language is designed so agents can read, reason about, and generate zag reliably — unambiguous grammar, explicit semantics, no magic.
-- Human and AI contributors propose, review, and implement features together through the ZEP process. Neither has special authority over the other; proposals stand on their reasoning.
-- Because AI agents can implement accepted ZEPs rapidly, the gap between "accepted proposal" and "shipped feature" shrinks significantly. This changes how we scope and sequence work — we can accept more ambitious proposals because implementation cost is lower.
-- The standard library and build system expose stable, machine-readable interfaces.
-- Language evolution is documented and deliberate — no undocumented dark corners.
+zag evolves Zig's foundations through a structured proposal process. The language grows in the directions its contributors — human and AI — define through ZEPs.
 
 ### First milestone: async
 
@@ -44,13 +61,15 @@ The first substantive evolution beyond Zig is a **proper async structure** (see 
 - zag is not a scripting language.
 - zag is not a Zig distribution or a Zig compatibility layer.
 - zag is not designed for backwards compatibility with Zig. Zig was the launch point; zag has its own trajectory.
+- zag is not an AI runtime. It does not ship an LLM or agent framework. It is a language that agents author.
 
 ## Design Principles
 
-1. **If a human can't read it, an agent shouldn't write it.** Legibility is a hard constraint.
+1. **Built by AI, for AI — and for humans.** Legibility is a hard constraint in both directions.
 2. **Syntax changes require a ZEP.** No ad-hoc evolution.
 3. **Every accepted ZEP ships with a spec update.** The spec and compiler stay in sync.
 4. **Breaking changes are explicit.** A ZEP that breaks existing programs must say so and provide a migration path.
+5. **Implementation velocity is an asset.** Use it to be more deliberate about design, not less.
 
 ## The ZEP Process
 
