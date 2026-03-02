@@ -433,9 +433,43 @@ const data = try task.join();
 
 ---
 
+## Council Review Notes (2026-03-02)
+
+**Recommendation: Do not move to Review yet.** Direction is promising; revision required before Review.
+
+### Findings
+
+**High severity**
+
+1. **Fiber blocking guarantees underspecified** — the zero-infection claim only holds if *all* blocking operations are wrapped to park/requeue fibers. The ZEP does not specify how this is guaranteed across the full stdlib or FFI. Stack growth, guard pages, and signal handling around blocking points must be addressed.
+
+2. **`zag.Scope` failure semantics need configurability** — "cancel siblings on first error" is not universal. Side-effectful tasks may have partially completed; cleanup logic expecting "wait all" breaks under auto-cancellation; `join()` called after `scope.wait()` has surprising cancellation states. A `fail-fast` vs `collect-all` policy surface is needed.
+
+**Medium severity**
+
+3. **`checkCancel()` nested scope composition undefined** — fiber-local cancellation state is implementable, but nested scopes require a *stack* of cancellation domains, not a single flag. Inner/outer cancellation will interfere incorrectly without a hierarchical model. Behavior when called outside a fiber context (native thread, interrupt handler) must also be specified.
+
+4. **`Io`-as-parameter dismissal is fair but incomplete** — the injection/testability benefits of `Io` (explicit dependency, no hidden runtime globals, compile-time I/O strategy substitution) are not acknowledged. The ZEP should justify what zag loses and why the ergonomic gain outweighs it.
+
+5. **Work-stealing pool omits safety-critical details** — lock-free deque correctness (ABA, memory ordering), lost wakeup protocol under timeout + cancellation, starvation under high blocking ratios, unbounded thread expansion via `zag.blockingCall`, and `ZAG_THREADS=1` semantics without yield points are all unaddressed.
+
+6. **Open questions too narrow for Review transition** — missing: panic/unwind across scope cancellation, deterministic ordering of error propagation between `task.join()` and `scope.wait()`, `Task` drop without `join()` (leak handling), ownership invariants for borrowed pointers across task boundaries, ABI/FFI contracts for stackful yield points.
+
+### What to address before moving to Review
+
+- [ ] Specify the fiber↔blocking-syscall contract for the full stdlib
+- [ ] Add `Scope` policy surface (`fail-fast` vs `collect-all`)
+- [ ] Define nested scope cancellation domain semantics
+- [ ] Acknowledge `Io` testability trade-off explicitly
+- [ ] Add work-stealing pool safety protocol (wakeup, starvation, blockingCall budget)
+- [ ] Expand open questions with panic/unwind, drop-without-join, FFI ABI
+
+---
+
 ## Status History
 
 | Date       | Status | Note                                                        | Council votes |
 |------------|--------|-------------------------------------------------------------|---------------|
 | 2026-03-02 | Draft  | Initial draft — Io-parameter model (rev 1)                  | —             |
 | 2026-03-02 | Draft  | Rev 2 — fiber-first, zero-infection; Io parameter rejected  | —             |
+| 2026-03-02 | Draft  | Council review: do not advance to Review; 6 findings logged | —             |
