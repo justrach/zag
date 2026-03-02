@@ -19,7 +19,11 @@ zag needed a starting point. The options were:
 
 **Option 2: divergent fork of Zig.**
 
-Zig's source was imported from Codeberg (`codeberg.org/ziglang/zig`) once as a starting point. zag does not track Zig upstream — it owns its own history from the fork point. Future Zig changes are evaluated case-by-case and cherry-picked if relevant, never merged wholesale.
+Zig's source was imported from Codeberg (`codeberg.org/ziglang/zig`) once as a starting point.
+
+**Fork-point commit:** `5e512051190602bbff0f9b06fbb4a9a9bf5a5fff` (Zig `main`, 2026-03-02)
+
+zag does not track Zig upstream — it owns its own history from the fork point. Future Zig changes are evaluated case-by-case and cherry-picked if relevant, never merged wholesale.
 
 ## Rationale
 
@@ -48,8 +52,9 @@ Zig's source was imported from Codeberg (`codeberg.org/ziglang/zig`) once as a s
 ## Consequences
 
 - zag is **not** a Zig compatibility layer. Programs written for Zig may not compile under zag once the two languages diverge.
-- The Zig import is a one-time operation. The `zig-upstream` remote may be kept for reference but is not an active upstream.
-- All code at the fork point is MIT-licensed (Zig's license). New zag contributions are covered by zag's own MIT license.
+- The `zig-upstream` remote is read-only reference. It is never merged into `main`; cherry-picks require a tracking comment citing the Zig commit SHA.
+- **Security/critical fixes:** If a CVE or critical bug is found in Zig's compiler or stdlib that also affects zag, a maintainer may cherry-pick the fix directly without a ZEP. The cherry-pick PR must reference the upstream commit and the CVE/issue. All other upstream changes require a ZEP.
+- **Attribution:** Source files inherited at the fork point retain Zig's MIT copyright header. New zag-originated files use the zag MIT header. Files substantially rewritten post-fork are relicensed to zag's header with a note of origin.
 
 ## Status History
 
