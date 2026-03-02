@@ -1,3 +1,1 @@
-# novel-blas
-# mistrusic
-# zag
+# zag-it
