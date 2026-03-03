@@ -8,9 +8,6 @@ This directory contains all ZEPs — the mechanism by which zag evolves.
 | 0000   | ZEP Template             | —        | Process  |
 | 0001   | The Zag Language Charter | Accepted | Process  |
 | 0002   | Structured Async         | Draft    | Language |
-| 0000   | ZEP Template             | —        | Process |
-| 0001   | The Zag Language Charter | Accepted | Process |
-| 0002   | Async Structure          | Draft    | Language |
 
 ## What is a ZEP?
 
