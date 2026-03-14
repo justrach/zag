@@ -133,6 +133,8 @@ int main(int argc, char **argv) {
             "pub const llvm_has_csky = false;\n"
             "pub const llvm_has_arc = false;\n"
             "pub const llvm_has_xtensa = false;\n"
+            "pub const llvm_has_polly = false;\n"
+
             "pub const version: [:0]const u8 = \"%s\";\n"
             "pub const semver = @import(\"std\").SemanticVersion.parse(version) catch unreachable;\n"
             "pub const enable_debug_extensions = false;\n"
