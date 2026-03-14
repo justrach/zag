@@ -5191,12 +5191,17 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
                 .root_src_path = "build_runner.zig",
             };
 
+            const force_llvm_for_build_runner = build_options.have_llvm and
+                resolved_target.result.cpu.arch == .aarch64 and
+                resolved_target.result.os.tag == .macos;
             const config = try Compilation.Config.resolve(.{
                 .output_mode = .Exe,
                 .resolved_target = resolved_target,
                 .have_zcu = true,
                 .emit_bin = true,
                 .is_test = false,
+                .use_llvm = if (force_llvm_for_build_runner) true else null,
+                .use_lib_llvm = if (force_llvm_for_build_runner) true else null,
             });
 
             const root_mod = try Package.Module.create(arena, .{
