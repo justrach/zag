@@ -29,7 +29,6 @@ jobs:
             zig_url: https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
             zig_archive: zig-host.tar.xz
             zig_dir: zig-aarch64-macos-0.15.2
-            shell: bash
             build_cmd: |
               brew install llvm@20 lld@20
               export PATH="$PWD/$ZIG_DIR:$PATH"
@@ -42,7 +41,6 @@ jobs:
             zig_url: https://ziglang.org/download/0.15.2/zig-x86_64-macos-0.15.2.tar.xz
             zig_archive: zig-host.tar.xz
             zig_dir: zig-x86_64-macos-0.15.2
-            shell: bash
             build_cmd: |
               brew install llvm@20 lld@20
               export PATH="$PWD/$ZIG_DIR:$PATH"
@@ -55,7 +53,6 @@ jobs:
             zig_url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
             zig_archive: zig-host.tar.xz
             zig_dir: zig-x86_64-linux-0.15.2
-            shell: bash
             build_cmd: |
               sudo apt-get update
               sudo apt-get install -y clang lld cmake ninja-build llvm-20-dev lld-20 libclang-20-dev
@@ -69,12 +66,11 @@ jobs:
             zig_url: https://ziglang.org/download/0.15.2/zig-x86_64-windows-0.15.2.zip
             zig_archive: zig-host.zip
             zig_dir: zig-x86_64-windows-0.15.2
-            shell: pwsh
             build_cmd: |
               choco install -y llvm
-              $env:PATH = "$PWD\$env:ZIG_DIR;$env:PATH"
-              zig build --release=fast -Denable-llvm=true --search-prefix "C:\Program Files\LLVM" --prefix "$PWD\out\$env:DIST_DIR"
-              Compress-Archive -Path "$PWD\out\$env:DIST_DIR" -DestinationPath "$PWD\$env:ARCHIVE_NAME"
+              export PATH="$PWD/$ZIG_DIR:/c/Program Files/LLVM/bin:$PATH"
+              zig build --release=fast -Denable-llvm=true --search-prefix "C:\Program Files\LLVM" --prefix "$PWD/out/$DIST_DIR"
+              powershell -NoProfile -Command "Compress-Archive -Path '$PWD/out/$DIST_DIR' -DestinationPath '$PWD/$ARCHIVE_NAME'"
 
     steps:
       - name: Checkout
@@ -104,13 +100,22 @@ jobs:
           ZIG_ARCHIVE: ${{ matrix.zig_archive }}
 
       - name: Build release archive
-        shell: ${{ matrix.shell }}
+        if: runner.os != 'Windows'
+        shell: bash
         run: ${{ matrix.build_cmd }}
         env:
           ZIG_DIR: ${{ matrix.zig_dir }}
           DIST_DIR: ${{ matrix.dist_dir }}
           ARCHIVE_NAME: ${{ matrix.archive_name }}
 
+      - name: Build release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: ${{ matrix.build_cmd }}
+        env:
+          ZIG_DIR: ${{ matrix.zig_dir }}
+          DIST_DIR: ${{ matrix.dist_dir }}
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
       - name: Upload release asset
         env:
           GH_TOKEN: ${{ github.token }}
