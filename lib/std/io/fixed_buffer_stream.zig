@@ -4,8 +4,7 @@ const testing = std.testing;
 const mem = std.mem;
 const assert = std.debug.assert;
 
-/// This turns a byte buffer into an `io.Writer`, `io.Reader`, or `io.SeekableStream`.
-/// If the supplied byte buffer is const, then `io.Writer` is not available.
+/// Deprecated in favor of `std.Io.Reader.fixed` and `std.Io.Writer.fixed`.
 pub fn FixedBufferStream(comptime Buffer: type) type {
     return struct {
         /// `Buffer` is either a `[]u8` or `[]const u8`.
@@ -17,18 +16,8 @@ pub fn FixedBufferStream(comptime Buffer: type) type {
         pub const SeekError = error{};
         pub const GetSeekPosError = error{};
 
-        pub const Reader = io.Reader(*Self, ReadError, read);
-        pub const Writer = io.Writer(*Self, WriteError, write);
-
-        pub const SeekableStream = io.SeekableStream(
-            *Self,
-            SeekError,
-            GetSeekPosError,
-            seekTo,
-            seekBy,
-            getPos,
-            getEndPos,
-        );
+        pub const Reader = io.GenericReader(*Self, ReadError, read);
+        pub const Writer = io.GenericWriter(*Self, WriteError, write);
 
         const Self = @This();
 
@@ -37,10 +26,6 @@ pub fn FixedBufferStream(comptime Buffer: type) type {
         }
 
         pub fn writer(self: *Self) Writer {
-            return .{ .context = self };
-        }
-
-        pub fn seekableStream(self: *Self) SeekableStream {
             return .{ .context = self };
         }
 

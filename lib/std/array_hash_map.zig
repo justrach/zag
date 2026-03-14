@@ -889,19 +889,10 @@ pub fn ArrayHashMapUnmanaged(
             self.pointer_stability.lock();
             defer self.pointer_stability.unlock();
 
-            if (new_capacity <= linear_scan_max) {
-                try self.entries.ensureTotalCapacity(gpa, new_capacity);
-                return;
-            }
-
-            if (self.index_header) |header| {
-                if (new_capacity <= header.capacity()) {
-                    try self.entries.ensureTotalCapacity(gpa, new_capacity);
-                    return;
-                }
-            }
-
             try self.entries.ensureTotalCapacity(gpa, new_capacity);
+            if (new_capacity <= linear_scan_max) return;
+            if (self.index_header) |header| if (new_capacity <= header.capacity()) return;
+
             const new_bit_index = try IndexHeader.findBitIndex(new_capacity);
             const new_header = try IndexHeader.alloc(gpa, new_bit_index);
 
@@ -1282,6 +1273,33 @@ pub fn ArrayHashMapUnmanaged(
             self.removeByIndex(index, if (store_hash) {} else ctx, .ordered);
         }
 
+        /// Remove the entries indexed by `sorted_indexes`. The indexes to be
+        /// removed correspond to state before deletion.
+        ///
+        /// This operation is O(N).
+        ///
+        /// Asserts that each index to be removed is in bounds.
+        ///
+        /// Invalidates key and element pointers beyond the first deleted index.
+        pub fn orderedRemoveAtMany(self: *Self, gpa: Allocator, sorted_indexes: []const usize) Oom!void {
+            if (@sizeOf(ByIndexContext) != 0)
+                @compileError("Cannot infer context " ++ @typeName(Context) ++ ", call orderedRemoveAtContext instead.");
+            return self.orderedRemoveAtManyContext(gpa, sorted_indexes, undefined);
+        }
+
+        pub fn orderedRemoveAtManyContext(
+            self: *Self,
+            gpa: Allocator,
+            sorted_indexes: []const usize,
+            ctx: Context,
+        ) Oom!void {
+            self.pointer_stability.lock();
+            defer self.pointer_stability.unlock();
+
+            self.entries.orderedRemoveMany(sorted_indexes);
+            try self.reIndexContext(gpa, ctx);
+        }
+
         /// Create a copy of the hash map which can be modified separately.
         /// The copy uses the same context as this instance, but is allocated
         /// with the provided allocator.
@@ -1351,7 +1369,7 @@ pub fn ArrayHashMapUnmanaged(
         pub fn setKeyContext(self: *Self, gpa: Allocator, index: usize, new_key: K, ctx: Context) Oom!void {
             const key_ptr = &self.entries.items(.key)[index];
             key_ptr.* = new_key;
-            if (store_hash) self.entries.items(.hash)[index].* = checkedHash(ctx, key_ptr.*);
+            if (store_hash) self.entries.items(.hash)[index] = checkedHash(ctx, key_ptr.*);
             try rebuildIndex(self, gpa, undefined);
         }
 
@@ -2095,7 +2113,7 @@ const IndexHeader = struct {
     /// Returns the attached array of indexes.  I must match the type
     /// returned by capacityIndexType.
     fn indexes(header: *IndexHeader, comptime I: type) []Index(I) {
-        const start_ptr: [*]Index(I) = @alignCast(@ptrCast(@as([*]u8, @ptrCast(header)) + @sizeOf(IndexHeader)));
+        const start_ptr: [*]Index(I) = @ptrCast(@alignCast(@as([*]u8, @ptrCast(header)) + @sizeOf(IndexHeader)));
         return start_ptr[0..header.length()];
     }
 
@@ -2116,7 +2134,7 @@ const IndexHeader = struct {
 
     fn findBitIndex(desired_capacity: usize) Allocator.Error!u8 {
         if (desired_capacity > max_capacity) return error.OutOfMemory;
-        var new_bit_index = @as(u8, @intCast(std.math.log2_int_ceil(usize, desired_capacity)));
+        var new_bit_index: u8 = @intCast(std.math.log2_int_ceil(usize, desired_capacity));
         if (desired_capacity > index_capacities[new_bit_index]) new_bit_index += 1;
         if (new_bit_index < min_bit_index) new_bit_index = min_bit_index;
         assert(desired_capacity <= index_capacities[new_bit_index]);
@@ -2129,9 +2147,9 @@ const IndexHeader = struct {
         const len = @as(usize, 1) << @as(math.Log2Int(usize), @intCast(new_bit_index));
         const index_size = hash_map.capacityIndexSize(new_bit_index);
         const nbytes = @sizeOf(IndexHeader) + index_size * len;
-        const bytes = try gpa.alignedAlloc(u8, @alignOf(IndexHeader), nbytes);
+        const bytes = try gpa.alignedAlloc(u8, .of(IndexHeader), nbytes);
         @memset(bytes[@sizeOf(IndexHeader)..], 0xff);
-        const result: *IndexHeader = @alignCast(@ptrCast(bytes.ptr));
+        const result: *IndexHeader = @ptrCast(@alignCast(bytes.ptr));
         result.* = .{
             .bit_index = new_bit_index,
         };
@@ -2486,13 +2504,13 @@ test "reIndex" {
 test "auto store_hash" {
     const HasCheapEql = AutoArrayHashMap(i32, i32);
     const HasExpensiveEql = AutoArrayHashMap([32]i32, i32);
-    try testing.expect(std.meta.fieldInfo(HasCheapEql.Data, .hash).type == void);
-    try testing.expect(std.meta.fieldInfo(HasExpensiveEql.Data, .hash).type != void);
+    try testing.expect(@FieldType(HasCheapEql.Data, "hash") == void);
+    try testing.expect(@FieldType(HasExpensiveEql.Data, "hash") != void);
 
     const HasCheapEqlUn = AutoArrayHashMapUnmanaged(i32, i32);
     const HasExpensiveEqlUn = AutoArrayHashMapUnmanaged([32]i32, i32);
-    try testing.expect(std.meta.fieldInfo(HasCheapEqlUn.Data, .hash).type == void);
-    try testing.expect(std.meta.fieldInfo(HasExpensiveEqlUn.Data, .hash).type != void);
+    try testing.expect(@FieldType(HasCheapEqlUn.Data, "hash") == void);
+    try testing.expect(@FieldType(HasExpensiveEqlUn.Data, "hash") != void);
 }
 
 test "sort" {
@@ -2550,10 +2568,26 @@ test "0 sized key and 0 sized value" {
     try testing.expectEqual(map.get(0), null);
 }
 
-test "setKey" {
+test "setKey storehash true" {
     const gpa = std.testing.allocator;
 
-    var map: AutoArrayHashMapUnmanaged(i32, i32) = .empty;
+    var map: ArrayHashMapUnmanaged(i32, i32, AutoContext(i32), true) = .empty;
+    defer map.deinit(gpa);
+
+    try map.put(gpa, 12, 34);
+    try map.put(gpa, 56, 78);
+
+    try map.setKey(gpa, 0, 42);
+    try testing.expectEqual(2, map.count());
+    try testing.expectEqual(false, map.contains(12));
+    try testing.expectEqual(34, map.get(42));
+    try testing.expectEqual(78, map.get(56));
+}
+
+test "setKey storehash false" {
+    const gpa = std.testing.allocator;
+
+    var map: ArrayHashMapUnmanaged(i32, i32, AutoContext(i32), false) = .empty;
     defer map.deinit(gpa);
 
     try map.put(gpa, 12, 34);
@@ -2643,4 +2677,30 @@ pub fn getAutoHashStratFn(comptime K: type, comptime Context: type, comptime str
             return @as(u32, @truncate(hasher.final()));
         }
     }.hash;
+}
+
+test "orderedRemoveAtMany" {
+    const gpa = testing.allocator;
+
+    var map: AutoArrayHashMapUnmanaged(usize, void) = .empty;
+    defer map.deinit(gpa);
+
+    for (0..10) |n| {
+        try map.put(gpa, n, {});
+    }
+
+    try map.orderedRemoveAtMany(gpa, &.{ 1, 5, 5, 7, 9 });
+    try testing.expectEqualSlices(usize, &.{ 0, 2, 3, 4, 6, 8 }, map.keys());
+
+    try map.orderedRemoveAtMany(gpa, &.{0});
+    try testing.expectEqualSlices(usize, &.{ 2, 3, 4, 6, 8 }, map.keys());
+
+    try map.orderedRemoveAtMany(gpa, &.{});
+    try testing.expectEqualSlices(usize, &.{ 2, 3, 4, 6, 8 }, map.keys());
+
+    try map.orderedRemoveAtMany(gpa, &.{ 1, 2, 3, 4 });
+    try testing.expectEqualSlices(usize, &.{2}, map.keys());
+
+    try map.orderedRemoveAtMany(gpa, &.{0});
+    try testing.expectEqualSlices(usize, &.{}, map.keys());
 }

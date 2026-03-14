@@ -1,55 +1,147 @@
-# zag
+![ZIG](https://ziglang.org/img/zig-logo-dynamic.svg)
 
-**zag** is a systems programming language built by AI, for AI — and for the humans who work alongside them.
+A general-purpose programming language and toolchain for maintaining
+**robust**, **optimal**, and **reusable** software.
 
-It diverges from [Zig](https://ziglang.org), keeping its core philosophy (explicit, no hidden allocations, errors as values) and evolving it through a structured proposal process.
+https://ziglang.org/
 
-## Status
+## Documentation
 
-Early design phase. The Zig source is imported; language divergence begins now via ZEPs.
+If you are looking at this README file in a source tree, please refer to the
+**Release Notes**, **Language Reference**, or **Standard Library
+Documentation** corresponding to the version of Zig that you are using by
+following the appropriate link on the
+[download page](https://ziglang.org/download).
 
-| Area        | State        |
-|-------------|--------------|
-| Source base | Zig `main` @ `5e512051` (2026-03-02) |
-| Language    | Zig-compatible (no divergence yet) |
-| Async (ZEP-0002) | Draft — first milestone |
+Otherwise, you're looking at a release of Zig, so you can find the language
+reference at `doc/langref.html`, and the standard library documentation by
+running `zig std`, which will open a browser tab.
 
-## Governance
+## Installation
 
-| Document | Purpose |
-|----------|---------|
-| [ZEP-0001 — Charter](docs/zep/ZEP-0001-charter.md) | Language vision and founding principles |
-| [ZEP process & index](docs/zep/README.md) | How to propose changes, ZEP lifecycle, council rules |
-| [ZEP-0000 — Template](docs/zep/ZEP-0000-template.md) | Copy this to write a ZEP |
-| [ADR-0001 — Divergent fork](docs/adr/ADR-0001-divergent-fork.md) | Why zag forked Zig and how upstream is handled |
-| [Council](docs/COUNCIL.md) | Language council membership and voting |
+ * [download a pre-built binary](https://ziglang.org/download/)
+ * [install from a package manager](https://github.com/ziglang/zig/wiki/Install-Zig-from-a-Package-Manager)
+ * [bootstrap zig for any target](https://github.com/ziglang/zig-bootstrap)
 
-## Contributing
+A Zig installation is composed of two things:
 
-**To propose a language change:**
-1. Open a [GitHub Issue](../../issues/new) tagged `zep:draft` to discuss your idea first.
-2. Copy [`docs/zep/ZEP-0000-template.md`](docs/zep/ZEP-0000-template.md), fill it in.
-3. Open a PR — a ZEP number will be assigned.
-4. See [docs/zep/README.md](docs/zep/README.md) for the full process.
+1. The Zig executable
+2. The lib/ directory
 
-**To fix bugs or improve tooling:** no ZEP needed — open a PR directly.
+At runtime, the executable searches up the file system for the lib/ directory,
+relative to itself:
 
-## Building
+* lib/
+* lib/zig/
+* ../lib/
+* ../lib/zig/
+* (and so on)
 
-zag builds from the same toolchain as Zig. Dependencies: CMake ≥ 3.15, LLVM/Clang/LLD 19.x.
+In other words, you can **unpack a release of Zig anywhere**, and then begin
+using it immediately. There is no need to install it globally, although this
+mechanism supports that use case too (i.e. `/usr/bin/zig` and `/usr/lib/zig/`).
 
-```sh
-mkdir build && cd build
+## Building from Source
+
+Ensure you have the required dependencies:
+
+ * CMake >= 3.15
+ * System C/C++ Toolchain
+ * LLVM, Clang, LLD development libraries == 20.x
+
+Then it is the standard CMake build process:
+
+```
+mkdir build
+cd build
 cmake ..
 make install
 ```
 
-For a no-LLVM bootstrap (C compiler only):
+For more options, tips, and troubleshooting, please see the
+[Building Zig From Source](https://github.com/ziglang/zig/wiki/Building-Zig-From-Source)
+page on the wiki.
 
-```sh
-cc -o bootstrap bootstrap.c && ./bootstrap
+## Building from Source without LLVM
+
+In this case, the only system dependency is a C compiler.
+
+```
+cc -o bootstrap bootstrap.c
+./bootstrap
 ```
 
-## Origin
+This produces a `zig2` executable in the current working directory. This is a
+"stage2" build of the compiler,
+[without LLVM extensions](https://github.com/ziglang/zig/issues/16270), and is
+therefore lacking these features:
+- Release mode optimizations
+- [aarch64 machine code backend](https://github.com/ziglang/zig/issues/21172)
+- [@cImport](https://github.com/ziglang/zig/issues/20630)
+- [zig translate-c](https://github.com/ziglang/zig/issues/20875)
+- [Ability to compile assembly files](https://github.com/ziglang/zig/issues/21169)
+- [Some ELF linking features](https://github.com/ziglang/zig/issues/17749)
+- [Most COFF/PE linking features](https://github.com/ziglang/zig/issues/17751)
+- [Some WebAssembly linking features](https://github.com/ziglang/zig/issues/17750)
+- [Ability to create import libs from def files](https://github.com/ziglang/zig/issues/17807)
+- [Ability to create static archives from object files](https://github.com/ziglang/zig/issues/9828)
+- Ability to compile C, C++, Objective-C, and Objective-C++ files
 
-Divergent fork of Zig — imported from `codeberg.org/ziglang/zig` at commit `5e512051`. zag owns its own history from here. See [ADR-0001](docs/adr/ADR-0001-divergent-fork.md).
+However, a compiler built this way does provide a C backend, which may be
+useful for creating system packages of Zig projects using the system C
+toolchain. **In this case, LLVM is not needed!**
+
+Furthermore, a compiler built this way provides an LLVM backend that produces
+bitcode files, which may be compiled into object files via a system Clang
+package. This can be used to produce system packages of Zig applications
+without the Zig package dependency on LLVM.
+
+## Contributing
+
+[Donate monthly](https://ziglang.org/zsf/).
+
+Zig is Free and Open Source Software. We welcome bug reports and patches from
+everyone. However, keep in mind that Zig governance is BDFN (Benevolent
+Dictator For Now) which means that Andrew Kelley has final say on the design
+and implementation of everything.
+
+One of the best ways you can contribute to Zig is to start using it for an
+open-source personal project.
+
+This leads to discovering bugs and helps flesh out use cases, which lead to
+further design iterations of Zig. Importantly, each issue found this way comes
+with real world motivations, making it straightforward to explain the reasoning
+behind proposals and feature requests.
+
+You will be taken much more seriously on the issue tracker if you have a
+personal project that uses Zig.
+
+The issue label
+[Contributor Friendly](https://github.com/ziglang/zig/issues?q=is%3Aissue+is%3Aopen+label%3A%22contributor+friendly%22)
+exists to help you find issues that are **limited in scope and/or knowledge of
+Zig internals.**
+
+Please note that issues labeled
+[Proposal](https://github.com/ziglang/zig/issues?q=is%3Aissue+is%3Aopen+label%3Aproposal)
+but do not also have the
+[Accepted](https://github.com/ziglang/zig/issues?q=is%3Aissue+is%3Aopen+label%3Aaccepted)
+label are still under consideration, and efforts to implement such a proposal
+have a high risk of being wasted. If you are interested in a proposal which is
+still under consideration, please express your interest in the issue tracker,
+providing extra insights and considerations that others have not yet expressed.
+The most highly regarded argument in such a discussion is a real world use case.
+
+For more tips, please see the
+[Contributing](https://github.com/ziglang/zig/wiki/Contributing) page on the
+wiki.
+
+## Community
+
+The Zig community is decentralized. Anyone is free to start and maintain their
+own space for Zig users to gather. There is no concept of "official" or
+"unofficial". Each gathering place has its own moderators and rules. Users are
+encouraged to be aware of the social structures of the spaces they inhabit, and
+work purposefully to facilitate spaces that align with their values.
+
+Please see the [Community](https://github.com/ziglang/zig/wiki/Community) wiki
+page for a public listing of social spaces.

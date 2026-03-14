@@ -135,6 +135,22 @@ pub fn MultiArrayList(comptime T: type) type {
                 self.* = undefined;
             }
 
+            /// Returns a `Slice` representing a range of elements in `s`, analagous to `arr[off..len]`.
+            /// It is illegal to call `deinit` or `toMultiArrayList` on the returned `Slice`.
+            /// Asserts that `off + len <= s.len`.
+            pub fn subslice(s: Slice, off: usize, len: usize) Slice {
+                assert(off + len <= s.len);
+                var ptrs: [fields.len][*]u8 = undefined;
+                inline for (s.ptrs, &ptrs, fields) |in, *out, field| {
+                    out.* = in + (off * @sizeOf(field.type));
+                }
+                return .{
+                    .ptrs = ptrs,
+                    .len = len,
+                    .capacity = len,
+                };
+            }
+
             /// This function is used in the debugger pretty formatters in tools/ to fetch the
             /// child field order and entry type to facilitate fancy debug printing for this type.
             fn dbHelper(self: *Slice, child: *Elem, field: *Field, entry: *Entry) void {
@@ -170,6 +186,7 @@ pub fn MultiArrayList(comptime T: type) type {
                     return lhs.alignment > rhs.alignment;
                 }
             };
+            @setEvalBranchQuota(3 * fields.len * std.math.log2(fields.len));
             mem.sort(Data, &data, {}, Sort.lessThan);
             var sizes_bytes: [fields.len]usize = undefined;
             var field_indexes: [fields.len]usize = undefined;
@@ -248,8 +265,8 @@ pub fn MultiArrayList(comptime T: type) type {
         /// Extend the list by 1 element, returning the newly reserved
         /// index with uninitialized data.
         /// Allocates more memory as necesasry.
-        pub fn addOne(self: *Self, allocator: Allocator) Allocator.Error!usize {
-            try self.ensureUnusedCapacity(allocator, 1);
+        pub fn addOne(self: *Self, gpa: Allocator) Allocator.Error!usize {
+            try self.ensureUnusedCapacity(gpa, 1);
             return self.addOneAssumeCapacity();
         }
 
@@ -333,6 +350,42 @@ pub fn MultiArrayList(comptime T: type) type {
             self.len -= 1;
         }
 
+        /// Remove the elements indexed by `sorted_indexes`. The indexes to be
+        /// removed correspond to the array list before deletion.
+        ///
+        /// Asserts:
+        /// * Each index to be removed is in bounds.
+        /// * The indexes to be removed are sorted ascending.
+        ///
+        /// Duplicates in `sorted_indexes` are allowed.
+        ///
+        /// This operation is O(N).
+        ///
+        /// Invalidates element pointers beyond the first deleted index.
+        pub fn orderedRemoveMany(self: *Self, sorted_indexes: []const usize) void {
+            if (sorted_indexes.len == 0) return;
+            const slices = self.slice();
+            var shift: usize = 1;
+            for (sorted_indexes[0 .. sorted_indexes.len - 1], sorted_indexes[1..]) |removed, end| {
+                if (removed == end) continue; // allows duplicates in `sorted_indexes`
+                const start = removed + 1;
+                const len = end - start; // safety checks `sorted_indexes` are sorted
+                inline for (fields, 0..) |_, field_index| {
+                    const field_slice = slices.items(@enumFromInt(field_index));
+                    @memmove(field_slice[start - shift ..][0..len], field_slice[start..][0..len]); // safety checks initial `sorted_indexes` are in range
+                }
+                shift += 1;
+            }
+            const start = sorted_indexes[sorted_indexes.len - 1] + 1;
+            const end = self.len;
+            const len = end - start; // safety checks final `sorted_indexes` are in range
+            inline for (fields, 0..) |_, field_index| {
+                const field_slice = slices.items(@enumFromInt(field_index));
+                @memmove(field_slice[start - shift ..][0..len], field_slice[start..][0..len]);
+            }
+            self.len = end - shift;
+        }
+
         /// Adjust the list's length to `new_len`.
         /// Does not initialize added items, if any.
         pub fn resize(self: *Self, gpa: Allocator, new_len: usize) !void {
@@ -349,11 +402,7 @@ pub fn MultiArrayList(comptime T: type) type {
             assert(new_len <= self.capacity);
             assert(new_len <= self.len);
 
-            const other_bytes = gpa.alignedAlloc(
-                u8,
-                @alignOf(Elem),
-                capacityInBytes(new_len),
-            ) catch {
+            const other_bytes = gpa.alignedAlloc(u8, .of(Elem), capacityInBytes(new_len)) catch {
                 const self_slice = self.slice();
                 inline for (fields, 0..) |field_info, i| {
                     if (@sizeOf(field_info.type) != 0) {
@@ -439,11 +488,7 @@ pub fn MultiArrayList(comptime T: type) type {
         /// `new_capacity` must be greater or equal to `len`.
         pub fn setCapacity(self: *Self, gpa: Allocator, new_capacity: usize) !void {
             assert(new_capacity >= self.len);
-            const new_bytes = try gpa.alignedAlloc(
-                u8,
-                @alignOf(Elem),
-                capacityInBytes(new_capacity),
-            );
+            const new_bytes = try gpa.alignedAlloc(u8, .of(Elem), capacityInBytes(new_capacity));
             if (self.len == 0) {
                 gpa.free(self.allocatedBytes());
                 self.bytes = new_bytes.ptr;
@@ -565,7 +610,7 @@ pub fn MultiArrayList(comptime T: type) type {
         }
 
         fn FieldType(comptime field: Field) type {
-            return meta.fieldInfo(Elem, field).type;
+            return @FieldType(Elem, @tagName(field));
         }
 
         const Entry = entry: {
@@ -977,4 +1022,68 @@ test "0 sized struct" {
 
     list.swapRemove(list.len - 1);
     try testing.expectEqualSlices(u0, &[_]u0{0}, list.items(.a));
+}
+
+test "struct with many fields" {
+    const ManyFields = struct {
+        fn Type(count: comptime_int) type {
+            @setEvalBranchQuota(50000);
+            var fields: [count]std.builtin.Type.StructField = undefined;
+            for (0..count) |i| {
+                fields[i] = .{
+                    .name = std.fmt.comptimePrint("a{}", .{i}),
+                    .type = u32,
+                    .default_value_ptr = null,
+                    .is_comptime = false,
+                    .alignment = @alignOf(u32),
+                };
+            }
+            const info: std.builtin.Type = .{ .@"struct" = .{
+                .layout = .auto,
+                .fields = &fields,
+                .decls = &.{},
+                .is_tuple = false,
+            } };
+            return @Type(info);
+        }
+
+        fn doTest(ally: std.mem.Allocator, count: comptime_int) !void {
+            var list: MultiArrayList(Type(count)) = .empty;
+            defer list.deinit(ally);
+
+            try list.resize(ally, 1);
+            list.items(.a0)[0] = 42;
+        }
+    };
+
+    try ManyFields.doTest(testing.allocator, 25);
+    try ManyFields.doTest(testing.allocator, 50);
+    try ManyFields.doTest(testing.allocator, 100);
+    try ManyFields.doTest(testing.allocator, 200);
+}
+
+test "orderedRemoveMany" {
+    const gpa = testing.allocator;
+
+    var list: MultiArrayList(struct { x: usize }) = .empty;
+    defer list.deinit(gpa);
+
+    for (0..10) |n| {
+        try list.append(gpa, .{ .x = n });
+    }
+
+    list.orderedRemoveMany(&.{ 1, 5, 5, 7, 9 });
+    try testing.expectEqualSlices(usize, &.{ 0, 2, 3, 4, 6, 8 }, list.items(.x));
+
+    list.orderedRemoveMany(&.{0});
+    try testing.expectEqualSlices(usize, &.{ 2, 3, 4, 6, 8 }, list.items(.x));
+
+    list.orderedRemoveMany(&.{});
+    try testing.expectEqualSlices(usize, &.{ 2, 3, 4, 6, 8 }, list.items(.x));
+
+    list.orderedRemoveMany(&.{ 1, 2, 3, 4 });
+    try testing.expectEqualSlices(usize, &.{2}, list.items(.x));
+
+    list.orderedRemoveMany(&.{0});
+    try testing.expectEqualSlices(usize, &.{}, list.items(.x));
 }

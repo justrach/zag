@@ -3,13 +3,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const fatal = std.process.fatal;
-const SeenPcsHeader = std.Build.Fuzz.abi.SeenPcsHeader;
+const SeenPcsHeader = std.Build.abi.fuzz.SeenPcsHeader;
 
 pub const std_options = std.Options{
     .logFn = logOverride,
 };
 
-var log_file: ?std.fs.File = null;
+var log_file_buffer: [256]u8 = undefined;
+var log_file_writer: ?std.fs.File.Writer = null;
 
 fn logOverride(
     comptime level: std.log.Level,
@@ -17,15 +18,17 @@ fn logOverride(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    const f = if (log_file) |f| f else f: {
+    const fw = if (log_file_writer) |*f| f else f: {
         const f = fuzzer.cache_dir.createFile("tmp/libfuzzer.log", .{}) catch
             @panic("failed to open fuzzer log file");
-        log_file = f;
-        break :f f;
+        log_file_writer = f.writer(&log_file_buffer);
+        break :f &log_file_writer.?;
     };
     const prefix1 = comptime level.asText();
     const prefix2 = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
-    f.writer().print(prefix1 ++ prefix2 ++ format ++ "\n", args) catch @panic("failed to write to fuzzer log");
+    fw.interface.print(prefix1 ++ prefix2 ++ format ++ "\n", args) catch
+        @panic("failed to write to fuzzer log");
+    fw.interface.flush() catch @panic("failed to flush fuzzer log");
 }
 
 /// Helps determine run uniqueness in the face of recursion.
@@ -82,6 +85,18 @@ export fn __sanitizer_cov_trace_pc_indir(callee: usize) void {
     //const pc = @returnAddress();
     //fuzzer.traceValue(pc ^ callee);
     //std.log.debug("0x{x}: indirect call to 0x{x}", .{ pc, callee });
+}
+export fn __sanitizer_cov_8bit_counters_init(start: usize, end: usize) void {
+    // clang will emit a call to this function when compiling with code coverage instrumentation.
+    // however fuzzer_init() does not need this information, since it directly reads from the symbol table.
+    _ = start;
+    _ = end;
+}
+export fn __sanitizer_cov_pcs_init(start: usize, end: usize) void {
+    // clang will emit a call to this function when compiling with code coverage instrumentation.
+    // however fuzzer_init() does not need this information, since it directly reads from the symbol table.
+    _ = start;
+    _ = end;
 }
 
 fn handleCmp(pc: usize, arg1: u64, arg2: u64) void {
@@ -214,18 +229,18 @@ const Fuzzer = struct {
                         .read = true,
                     }) catch |e| switch (e) {
                         error.PathAlreadyExists => continue,
-                        else => fatal("unable to create '{}{d}: {s}", .{ f.corpus_directory, i, @errorName(err) }),
+                        else => fatal("unable to create '{f}{d}: {s}", .{ f.corpus_directory, i, @errorName(err) }),
                     };
                     errdefer input_file.close();
                     // Initialize the mmap for the current input.
                     f.input = MemoryMappedList.create(input_file, 0, std.heap.page_size_max) catch |e| {
-                        fatal("unable to init memory map for input at '{}{d}': {s}", .{
+                        fatal("unable to init memory map for input at '{f}{d}': {s}", .{
                             f.corpus_directory, i, @errorName(e),
                         });
                     };
                     break;
                 },
-                else => fatal("unable to read '{}{d}': {s}", .{ f.corpus_directory, i, @errorName(err) }),
+                else => fatal("unable to read '{f}{d}': {s}", .{ f.corpus_directory, i, @errorName(err) }),
             };
             errdefer gpa.free(input);
             f.corpus.append(gpa, .{
@@ -251,7 +266,7 @@ const Fuzzer = struct {
             const sub_path = try std.fmt.allocPrint(gpa, "f/{s}", .{f.unit_test_name});
             f.corpus_directory = .{
                 .handle = f.cache_dir.makeOpenPath(sub_path, .{}) catch |err|
-                    fatal("unable to open corpus directory 'f/{s}': {s}", .{ sub_path, @errorName(err) }),
+                    fatal("unable to open corpus directory 'f/{s}': {t}", .{ sub_path, err }),
                 .path = sub_path,
             };
             initNextInput(f);
@@ -441,7 +456,7 @@ export fn fuzzer_coverage_id() u64 {
     return fuzzer.coverage_id;
 }
 
-var fuzzer_one: *const fn (input_ptr: [*]const u8, input_len: usize) callconv(.C) void = undefined;
+var fuzzer_one: *const fn (input_ptr: [*]const u8, input_len: usize) callconv(.c) void = undefined;
 
 export fn fuzzer_start(testOne: @TypeOf(fuzzer_one)) void {
     fuzzer_one = testOne;
@@ -456,27 +471,42 @@ export fn fuzzer_init(cache_dir_struct: Fuzzer.Slice) void {
     // Linkers are expected to automatically add `__start_<section>` and
     // `__stop_<section>` symbols when section names are valid C identifiers.
 
-    const pc_counters_start = @extern([*]u8, .{
-        .name = "__start___sancov_cntrs",
-        .linkage = .weak,
-    }) orelse fatal("missing __start___sancov_cntrs symbol", .{});
+    const ofmt = builtin.object_format;
 
-    const pc_counters_end = @extern([*]u8, .{
-        .name = "__stop___sancov_cntrs",
+    const start_symbol_prefix: []const u8 = if (ofmt == .macho)
+        "\x01section$start$__DATA$__"
+    else
+        "__start___";
+    const end_symbol_prefix: []const u8 = if (ofmt == .macho)
+        "\x01section$end$__DATA$__"
+    else
+        "__stop___";
+
+    const pc_counters_start_name = start_symbol_prefix ++ "sancov_cntrs";
+    const pc_counters_start = @extern([*]u8, .{
+        .name = pc_counters_start_name,
         .linkage = .weak,
-    }) orelse fatal("missing __stop___sancov_cntrs symbol", .{});
+    }) orelse fatal("missing {s} symbol", .{pc_counters_start_name});
+
+    const pc_counters_end_name = end_symbol_prefix ++ "sancov_cntrs";
+    const pc_counters_end = @extern([*]u8, .{
+        .name = pc_counters_end_name,
+        .linkage = .weak,
+    }) orelse fatal("missing {s} symbol", .{pc_counters_end_name});
 
     const pc_counters = pc_counters_start[0 .. pc_counters_end - pc_counters_start];
 
+    const pcs_start_name = start_symbol_prefix ++ "sancov_pcs1";
     const pcs_start = @extern([*]usize, .{
-        .name = "__start___sancov_pcs1",
+        .name = pcs_start_name,
         .linkage = .weak,
-    }) orelse fatal("missing __start___sancov_pcs1 symbol", .{});
+    }) orelse fatal("missing {s} symbol", .{pcs_start_name});
 
+    const pcs_end_name = end_symbol_prefix ++ "sancov_pcs1";
     const pcs_end = @extern([*]usize, .{
-        .name = "__stop___sancov_pcs1",
+        .name = pcs_end_name,
         .linkage = .weak,
-    }) orelse fatal("missing __stop___sancov_pcs1 symbol", .{});
+    }) orelse fatal("missing {s} symbol", .{pcs_end_name});
 
     const pcs = pcs_start[0 .. pcs_end - pcs_start];
 

@@ -195,11 +195,11 @@ pub fn kdf(
         params.r > max_int / 256 or
         n > max_int / 128 / @as(u64, params.r)) return KdfError.WeakParameters;
 
-    const xy = try allocator.alignedAlloc(u32, 16, 64 * params.r);
+    const xy = try allocator.alignedAlloc(u32, .@"16", 64 * params.r);
     defer allocator.free(xy);
-    const v = try allocator.alignedAlloc(u32, 16, 32 * n * params.r);
+    const v = try allocator.alignedAlloc(u32, .@"16", 32 * n * params.r);
     defer allocator.free(v);
-    var dk = try allocator.alignedAlloc(u8, 16, params.p * 128 * params.r);
+    var dk = try allocator.alignedAlloc(u8, .@"16", params.p * 128 * params.r);
     defer allocator.free(dk);
 
     try pwhash.pbkdf2(dk, password, salt, 1, HmacSha256);
@@ -311,9 +311,10 @@ const crypt_format = struct {
 
     /// Compute the number of bytes required to serialize `params`
     pub fn calcSize(params: anytype) usize {
-        var buf = io.countingWriter(io.null_writer);
-        serializeTo(params, buf.writer()) catch unreachable;
-        return @as(usize, @intCast(buf.bytes_written));
+        var trash: [128]u8 = undefined;
+        var d: std.Io.Writer.Discarding = .init(&trash);
+        serializeTo(params, &d) catch unreachable;
+        return @intCast(d.fullCount());
     }
 
     fn serializeTo(params: anytype, out: anytype) !void {

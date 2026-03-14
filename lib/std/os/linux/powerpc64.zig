@@ -15,90 +15,125 @@ const sockaddr = linux.sockaddr;
 const timespec = linux.timespec;
 
 pub fn syscall0(number: SYS) usize {
+    // r0 is both an input register and a clobber. musl and glibc achieve this with
+    // a "+" constraint, which isn't supported in Zig, so instead we separately list
+    // r0 as both an input and an output. (Listing it as an input and a clobber would
+    // cause the C backend to emit invalid code; see #25209.)
+    var r0_out: usize = undefined;
     return asm volatile (
         \\ sc
         \\ bns+ 1f
         \\ neg 3, 3
         \\ 1:
         : [ret] "={r3}" (-> usize),
+          [r0_out] "={r0}" (r0_out),
         : [number] "{r0}" (@intFromEnum(number)),
-        : "memory", "cr0", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12"
-    );
+        : .{ .memory = true, .cr0 = true, .r4 = true, .r5 = true, .r6 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .ctr = true, .xer = true });
 }
 
 pub fn syscall1(number: SYS, arg1: usize) usize {
+    // r0 is both an input and a clobber.
+    var r0_out: usize = undefined;
     return asm volatile (
         \\ sc
         \\ bns+ 1f
         \\ neg 3, 3
         \\ 1:
         : [ret] "={r3}" (-> usize),
+          [r0_out] "={r0}" (r0_out),
         : [number] "{r0}" (@intFromEnum(number)),
           [arg1] "{r3}" (arg1),
-        : "memory", "cr0", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12"
-    );
+        : .{ .memory = true, .cr0 = true, .r4 = true, .r5 = true, .r6 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .ctr = true, .xer = true });
 }
 
 pub fn syscall2(number: SYS, arg1: usize, arg2: usize) usize {
+    // These registers are both inputs and clobbers.
+    var r0_out: usize = undefined;
+    var r4_out: usize = undefined;
     return asm volatile (
         \\ sc
         \\ bns+ 1f
         \\ neg 3, 3
         \\ 1:
         : [ret] "={r3}" (-> usize),
+          [r0_out] "={r0}" (r0_out),
+          [r4_out] "={r4}" (r4_out),
         : [number] "{r0}" (@intFromEnum(number)),
           [arg1] "{r3}" (arg1),
           [arg2] "{r4}" (arg2),
-        : "memory", "cr0", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12"
-    );
+        : .{ .memory = true, .cr0 = true, .r5 = true, .r6 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .ctr = true, .xer = true });
 }
 
 pub fn syscall3(number: SYS, arg1: usize, arg2: usize, arg3: usize) usize {
+    // These registers are both inputs and clobbers.
+    var r0_out: usize = undefined;
+    var r4_out: usize = undefined;
+    var r5_out: usize = undefined;
     return asm volatile (
         \\ sc
         \\ bns+ 1f
         \\ neg 3, 3
         \\ 1:
         : [ret] "={r3}" (-> usize),
+          [r0_out] "={r0}" (r0_out),
+          [r4_out] "={r4}" (r4_out),
+          [r5_out] "={r5}" (r5_out),
         : [number] "{r0}" (@intFromEnum(number)),
           [arg1] "{r3}" (arg1),
           [arg2] "{r4}" (arg2),
           [arg3] "{r5}" (arg3),
-        : "memory", "cr0", "r6", "r7", "r8", "r9", "r10", "r11", "r12"
-    );
+        : .{ .memory = true, .cr0 = true, .r6 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .ctr = true, .xer = true });
 }
 
 pub fn syscall4(number: SYS, arg1: usize, arg2: usize, arg3: usize, arg4: usize) usize {
+    // These registers are both inputs and clobbers.
+    var r0_out: usize = undefined;
+    var r4_out: usize = undefined;
+    var r5_out: usize = undefined;
+    var r6_out: usize = undefined;
     return asm volatile (
         \\ sc
         \\ bns+ 1f
         \\ neg 3, 3
         \\ 1:
         : [ret] "={r3}" (-> usize),
+          [r0_out] "={r0}" (r0_out),
+          [r4_out] "={r4}" (r4_out),
+          [r5_out] "={r5}" (r5_out),
+          [r6_out] "={r6}" (r6_out),
         : [number] "{r0}" (@intFromEnum(number)),
           [arg1] "{r3}" (arg1),
           [arg2] "{r4}" (arg2),
           [arg3] "{r5}" (arg3),
           [arg4] "{r6}" (arg4),
-        : "memory", "cr0", "r7", "r8", "r9", "r10", "r11", "r12"
-    );
+        : .{ .memory = true, .cr0 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .ctr = true, .xer = true });
 }
 
 pub fn syscall5(number: SYS, arg1: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize) usize {
+    // These registers are both inputs and clobbers.
+    var r0_out: usize = undefined;
+    var r4_out: usize = undefined;
+    var r5_out: usize = undefined;
+    var r6_out: usize = undefined;
+    var r7_out: usize = undefined;
     return asm volatile (
         \\ sc
         \\ bns+ 1f
         \\ neg 3, 3
         \\ 1:
         : [ret] "={r3}" (-> usize),
+          [r0_out] "={r0}" (r0_out),
+          [r4_out] "={r4}" (r4_out),
+          [r5_out] "={r5}" (r5_out),
+          [r6_out] "={r6}" (r6_out),
+          [r7_out] "={r7}" (r7_out),
         : [number] "{r0}" (@intFromEnum(number)),
           [arg1] "{r3}" (arg1),
           [arg2] "{r4}" (arg2),
           [arg3] "{r5}" (arg3),
           [arg4] "{r6}" (arg4),
           [arg5] "{r7}" (arg5),
-        : "memory", "cr0", "r8", "r9", "r10", "r11", "r12"
-    );
+        : .{ .memory = true, .cr0 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .ctr = true, .xer = true });
 }
 
 pub fn syscall6(
@@ -110,12 +145,25 @@ pub fn syscall6(
     arg5: usize,
     arg6: usize,
 ) usize {
+    // These registers are both inputs and clobbers.
+    var r0_out: usize = undefined;
+    var r4_out: usize = undefined;
+    var r5_out: usize = undefined;
+    var r6_out: usize = undefined;
+    var r7_out: usize = undefined;
+    var r8_out: usize = undefined;
     return asm volatile (
         \\ sc
         \\ bns+ 1f
         \\ neg 3, 3
         \\ 1:
         : [ret] "={r3}" (-> usize),
+          [r0_out] "={r0}" (r0_out),
+          [r4_out] "={r4}" (r4_out),
+          [r5_out] "={r5}" (r5_out),
+          [r6_out] "={r6}" (r6_out),
+          [r7_out] "={r7}" (r7_out),
+          [r8_out] "={r8}" (r8_out),
         : [number] "{r0}" (@intFromEnum(number)),
           [arg1] "{r3}" (arg1),
           [arg2] "{r4}" (arg2),
@@ -123,11 +171,10 @@ pub fn syscall6(
           [arg4] "{r6}" (arg4),
           [arg5] "{r7}" (arg5),
           [arg6] "{r8}" (arg6),
-        : "memory", "cr0", "r9", "r10", "r11", "r12"
-    );
+        : .{ .memory = true, .cr0 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .ctr = true, .xer = true });
 }
 
-pub fn clone() callconv(.Naked) usize {
+pub fn clone() callconv(.naked) usize {
     // __clone(func, stack, flags, arg, ptid, tls, ctid)
     //         3,    4,     5,     6,   7,    8,   9
     //
@@ -184,13 +231,20 @@ pub fn clone() callconv(.Naked) usize {
 
 pub const restore = restore_rt;
 
-pub fn restore_rt() callconv(.Naked) noreturn {
-    asm volatile (
-        \\ sc
-        :
-        : [number] "{r0}" (@intFromEnum(SYS.rt_sigreturn)),
-        : "memory", "cr0", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12"
-    );
+pub fn restore_rt() callconv(.naked) noreturn {
+    switch (@import("builtin").zig_backend) {
+        .stage2_c => asm volatile (
+            \\ li 0, %[number]
+            \\ sc
+            :
+            : [number] "i" (@intFromEnum(SYS.rt_sigreturn)),
+            : .{ .memory = true, .cr0 = true, .r4 = true, .r5 = true, .r6 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true }),
+        else => _ = asm volatile (
+            \\ sc
+            :
+            : [number] "{r0}" (@intFromEnum(SYS.rt_sigreturn)),
+            : .{ .memory = true, .cr0 = true, .r4 = true, .r5 = true, .r6 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true }),
+    }
 }
 
 pub const F = struct {
@@ -231,26 +285,6 @@ pub const Flock = extern struct {
     len: off_t,
     pid: pid_t,
     __unused: [4]u8,
-};
-
-pub const msghdr = extern struct {
-    name: ?*sockaddr,
-    namelen: socklen_t,
-    iov: [*]iovec,
-    iovlen: usize,
-    control: ?*anyopaque,
-    controllen: usize,
-    flags: i32,
-};
-
-pub const msghdr_const = extern struct {
-    name: ?*const sockaddr,
-    namelen: socklen_t,
-    iov: [*]const iovec_const,
-    iovlen: usize,
-    control: ?*const anyopaque,
-    controllen: usize,
-    flags: i32,
 };
 
 pub const blksize_t = i64;
@@ -337,7 +371,7 @@ pub const ucontext_t = extern struct {
     flags: u32,
     link: ?*ucontext_t,
     stack: stack_t,
-    sigmask: sigset_t,
+    sigmask: [1024 / @bitSizeOf(c_ulong)]c_ulong, // Currently a libc-compatible (1024-bit) sigmask
     mcontext: mcontext_t,
 };
 
