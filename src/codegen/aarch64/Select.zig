@@ -966,7 +966,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) error{ OutOfMemory,
             const arg_vi = isel.live_values.fetchRemove(air.inst_index).?.value;
             defer arg_vi.deref(isel);
             switch (arg_vi.parent(isel)) {
-                .unallocated, .stack_slot => if (arg_vi.hint(isel)) |arg_ra| {
+                .unallocated => if (arg_vi.hint(isel)) |arg_ra| {
                     try arg_vi.defLiveIn(isel, arg_ra, comptime &.initFill(.free));
                 } else {
                     var arg_part_it = arg_vi.parts(isel);
@@ -974,6 +974,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) error{ OutOfMemory,
                         try arg_part.defLiveIn(isel, arg_part.hint(isel).?, comptime &.initFill(.free));
                     }
                 },
+                .stack_slot => {},
                 .value, .constant => unreachable,
                 .address => |address_vi| try address_vi.defLiveIn(isel, address_vi.hint(isel).?, comptime &.initFill(.free)),
             }
@@ -4990,8 +4991,9 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) error{ OutOfMemory,
                     codegen.errUnionPayloadOffset(payload_ty, zcu),
                     payload_vi.value.size(isel),
                 );
-                const payload_part_vi = try payload_part_it.only(isel);
-                try payload_vi.value.copy(isel, payload_ty, payload_part_vi.?);
+                const payload_part_vi = try payload_part_it.only(isel) orelse
+                    return isel.fail("multi-part error union payload not yet supported", .{});
+                try payload_vi.value.copy(isel, payload_ty, payload_part_vi);
             }
 
             const cont_label = isel.instructions.items.len;
@@ -5773,8 +5775,9 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) error{ OutOfMemory,
                     codegen.errUnionPayloadOffset(ty_op.ty.toType(), zcu),
                     payload_vi.value.size(isel),
                 );
-                const payload_part_vi = try payload_part_it.only(isel);
-                try payload_vi.value.copy(isel, ty_op.ty.toType(), payload_part_vi.?);
+                const payload_part_vi = try payload_part_it.only(isel) orelse
+                    return isel.fail("multi-part error union payload not yet supported", .{});
+                try payload_vi.value.copy(isel, ty_op.ty.toType(), payload_part_vi);
             }
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
@@ -5791,8 +5794,9 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) error{ OutOfMemory,
                     codegen.errUnionErrorOffset(error_union_ty.errorUnionPayload(zcu), zcu),
                     error_set_vi.value.size(isel),
                 );
-                const error_set_part_vi = try error_set_part_it.only(isel);
-                try error_set_vi.value.copy(isel, ty_op.ty.toType(), error_set_part_vi.?);
+                const error_set_part_vi = try error_set_part_it.only(isel) orelse
+                    return isel.fail("multi-part error union error set not yet supported", .{});
+                try error_set_vi.value.copy(isel, ty_op.ty.toType(), error_set_part_vi);
             }
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
@@ -5890,8 +5894,9 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) error{ OutOfMemory,
                 const payload_size = payload_ty.abiSize(zcu);
 
                 var payload_part_it = error_union_vi.value.field(error_union_ty, payload_offset, payload_size);
-                const payload_part_vi = try payload_part_it.only(isel);
-                try payload_part_vi.?.move(isel, ty_op.operand);
+                const payload_part_vi = try payload_part_it.only(isel) orelse
+                    return isel.fail("multi-part error union payload not yet supported", .{});
+                try payload_part_vi.move(isel, ty_op.operand);
                 var error_set_part_it = error_union_vi.value.field(error_union_ty, error_set_offset, error_set_size);
                 const error_set_part_vi = try error_set_part_it.only(isel);
                 if (try error_set_part_vi.?.defReg(isel)) |error_set_part_ra| try isel.emit(switch (error_set_size) {
@@ -6042,11 +6047,12 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) error{ OutOfMemory,
                                 const field_subpart_offset, const field_subpart_size = field_subpart_vi.position(isel);
                                 var agg_subpart_it = agg_part.vi.field(
                                     field_ty,
-                                    agg_part.offset + field_subpart_offset - field_part_offset,
+                                    field_subpart_offset - field_part_offset,
                                     field_subpart_size,
                                 );
-                                const agg_subpart_vi = try agg_subpart_it.only(isel);
-                                try agg_subpart_vi.?.liveOut(isel, field_subpart_ra);
+                                const agg_subpart_vi = try agg_subpart_it.only(isel) orelse
+                                    return isel.fail("multi-part aggregate field copy not yet supported", .{});
+                                try agg_subpart_vi.liveOut(isel, field_subpart_ra);
                             }
                         }
                     },
@@ -9755,11 +9761,28 @@ pub const Value = struct {
                 offset += vi.get(isel).offset_from_parent;
                 switch (vi.parent(isel)) {
                     else => unreachable,
-                    .unallocated => return def_ra,
+                    .unallocated => {
+                        var part_it = def_vi.parts(isel);
+                        if (part_it.only() == null) {
+                            while (part_it.next()) |part_vi| {
+                                if (part_vi.register(isel)) |part_ra| {
+                                    const live_entry = isel.live_registers.getPtr(part_ra);
+                                    if (live_entry.* == part_vi) {
+                                        part_vi.get(isel).location_payload.small.register = .zr;
+                                        live_entry.* = .free;
+                                    }
+                                }
+                            }
+                        }
+                        return def_ra;
+                    },
                     .stack_slot => |stack_slot| {
                         offset += stack_slot.offset;
                         const def_is_vector = def_vi.isVector(isel);
-                        const ra = def_ra orelse if (def_is_vector) try isel.allocVecReg() else try isel.allocIntReg();
+                        const ra = def_ra orelse if (def_is_vector or def_vi.size(isel) > 8)
+                            try isel.allocVecReg()
+                        else
+                            try isel.allocIntReg();
                         defer if (def_ra == null) isel.freeReg(ra);
                         try isel.storeReg(ra, def_vi.size(isel), stack_slot.base, offset);
                         return ra;
@@ -10176,12 +10199,8 @@ pub const Value = struct {
                             } else unreachable,
                             9...15 => if (offset == 0 and size == ty_size) {
                                 vi.setParts(isel, 2);
-                                _ = vi.addPart(isel, 0, 8);
-                                _ = vi.addPart(isel, 8, ty_size - 8);
-                            } else if (offset == 8 and size == ty_size - 8) {
-                                vi.setParts(isel, 2);
-                                _ = vi.addPart(isel, 0, child_size - 8);
-                                _ = vi.addPart(isel, child_size - 8, 1);
+                                _ = vi.addPart(isel, 0, child_size);
+                                _ = vi.addPart(isel, child_size, 1);
                             } else unreachable,
                             else => return isel.fail("Value.FieldPartIterator.next({f})", .{isel.fmtType(ty)}),
                         }
@@ -10227,12 +10246,18 @@ pub const Value = struct {
                                 prev_part.size = combined_size;
                                 continue;
                             }
+                            if (parts_len == Value.max_parts)
+                                return isel.fail("Value.FieldPartIterator.next(array {f})", .{isel.fmtType(ty)});
                             parts[parts_len] = .{ .offset = elem_begin, .size = elem_size };
                             parts_len += 1;
                         }
+                        if (parts_len < 2)
+                            return isel.fail("Value.FieldPartIterator.next(array {f})", .{isel.fmtType(ty)});
                         vi.setParts(isel, parts_len);
                         for (parts[0..parts_len]) |part| {
-                            const subpart_vi = vi.addPart(isel, part.offset - offset, part.size);
+                            const part_begin = @max(part.offset, offset);
+                            const part_end = @min(part.offset + part.size, offset + size);
+                            const subpart_vi = vi.addPart(isel, part_begin - offset, part_end - part_begin);
                             if (elem_signedness) |signedness| subpart_vi.setSignedness(isel, signedness);
                             if (elem_is_vector) subpart_vi.setIsVector(isel);
                         }
@@ -10289,6 +10314,8 @@ pub const Value = struct {
                                 prev_part.is_vector &= field_is_vector;
                                 continue;
                             }
+                            if (parts_len == Value.max_parts)
+                                return isel.fail("Value.FieldPartIterator.next(error_union {f})", .{isel.fmtType(ty)});
                             parts[parts_len] = .{
                                 .offset = field_begin,
                                 .size = field_size,
@@ -10297,9 +10324,13 @@ pub const Value = struct {
                             };
                             parts_len += 1;
                         }
+                        if (parts_len < 2)
+                            return isel.fail("Value.FieldPartIterator.next(error_union {f})", .{isel.fmtType(ty)});
                         vi.setParts(isel, parts_len);
                         for (parts[0..parts_len]) |part| {
-                            const subpart_vi = vi.addPart(isel, part.offset - offset, part.size);
+                            const part_begin = @max(part.offset, offset);
+                            const part_end = @min(part.offset + part.size, offset + size);
+                            const subpart_vi = vi.addPart(isel, part_begin - offset, part_end - part_begin);
                             if (part.signedness) |signedness| subpart_vi.setSignedness(isel, signedness);
                             if (part.is_vector) subpart_vi.setIsVector(isel);
                         }
@@ -10390,6 +10421,8 @@ pub const Value = struct {
                                 prev_part.is_vector &= field_is_vector;
                                 continue;
                             }
+                            if (parts_len == Value.max_parts)
+                                return isel.fail("Value.FieldPartIterator.next(struct {f})", .{isel.fmtType(ty)});
                             parts[parts_len] = .{
                                 .offset = field_begin,
                                 .size = field_size,
@@ -10398,9 +10431,13 @@ pub const Value = struct {
                             };
                             parts_len += 1;
                         }
+                        if (parts_len < 2)
+                            return isel.fail("Value.FieldPartIterator.next(struct {f})", .{isel.fmtType(ty)});
                         vi.setParts(isel, parts_len);
                         for (parts[0..parts_len]) |part| {
-                            const subpart_vi = vi.addPart(isel, part.offset - offset, part.size);
+                            const part_begin = @max(part.offset, offset);
+                            const part_end = @min(part.offset + part.size, offset + size);
+                            const subpart_vi = vi.addPart(isel, part_begin - offset, part_end - part_begin);
                             if (part.signedness) |signedness| subpart_vi.setSignedness(isel, signedness);
                             if (part.is_vector) subpart_vi.setIsVector(isel);
                         }
@@ -10444,12 +10481,18 @@ pub const Value = struct {
                                 prev_part.is_vector &= field_is_vector;
                                 continue;
                             }
+                            if (parts_len == Value.max_parts)
+                                return isel.fail("Value.FieldPartIterator.next(tuple {f})", .{isel.fmtType(ty)});
                             parts[parts_len] = .{ .offset = field_begin, .size = field_size, .is_vector = field_is_vector };
                             parts_len += 1;
                         }
+                        if (parts_len < 2)
+                            return isel.fail("Value.FieldPartIterator.next(tuple {f})", .{isel.fmtType(ty)});
                         vi.setParts(isel, parts_len);
                         for (parts[0..parts_len]) |part| {
-                            const subpart_vi = vi.addPart(isel, part.offset - offset, part.size);
+                            const part_begin = @max(part.offset, offset);
+                            const part_end = @min(part.offset + part.size, offset + size);
+                            const subpart_vi = vi.addPart(isel, part_begin - offset, part_end - part_begin);
                             if (part.is_vector) subpart_vi.setIsVector(isel);
                         }
                     },
@@ -10511,6 +10554,8 @@ pub const Value = struct {
                                 prev_part.signedness = null;
                                 continue;
                             }
+                            if (parts_len == Value.max_parts)
+                                return isel.fail("Value.FieldPartIterator.next(union {f})", .{isel.fmtType(ty)});
                             parts[parts_len] = .{
                                 .offset = field_begin,
                                 .size = field_size,
@@ -10518,9 +10563,13 @@ pub const Value = struct {
                             };
                             parts_len += 1;
                         }
+                        if (parts_len < 2)
+                            return isel.fail("Value.FieldPartIterator.next(union {f})", .{isel.fmtType(ty)});
                         vi.setParts(isel, parts_len);
                         for (parts[0..parts_len]) |part| {
-                            const subpart_vi = vi.addPart(isel, part.offset - offset, part.size);
+                            const part_begin = @max(part.offset, offset);
+                            const part_end = @min(part.offset + part.size, offset + size);
+                            const subpart_vi = vi.addPart(isel, part_begin - offset, part_end - part_begin);
                             if (part.signedness) |signedness| subpart_vi.setSignedness(isel, signedness);
                         }
                     },
@@ -10551,7 +10600,7 @@ pub const Value = struct {
                 }
             }
             it.next_offset = next_offset + size;
-            return .{ .offset = next_part_offset - next_offset, .vi = vi };
+            return .{ .offset = next_part_offset, .vi = vi };
         }
 
         fn only(it: *FieldPartIterator, isel: *Select) !?Value.Index {
@@ -11773,7 +11822,10 @@ fn merge(
                 assert(actual_vi.* == .free);
                 actual_vi.* = .allocating;
             },
-            .free => if (opts.fill_extra) assert(try isel.fillMemory(ra) and actual_vi.* == .free),
+            .free => if (opts.fill_extra) {
+                if (actual_vi.* != .allocating)
+                    assert(try isel.fillMemory(ra) and actual_vi.* == .free);
+            },
         }
     }
     live_reg_it = isel.live_registers.iterator();
@@ -11787,7 +11839,10 @@ fn merge(
                 actual_vi.* = expected_vi;
             },
             .allocating => assert(actual_vi.* == .allocating),
-            .free => if (opts.fill_extra) assert(actual_vi.* == .free),
+            .free => if (opts.fill_extra) {
+                if (actual_vi.* != .free and actual_vi.* != .allocating)
+                    assert(try isel.fillMemory(ra) and actual_vi.* == .free);
+            },
         }
     }
 }
@@ -11893,7 +11948,7 @@ const call = struct {
             else => unreachable,
             param_reg, callee_clobbered_reg => switch (live_reg_entry.value.*) {
                 _ => {},
-                .allocating => unreachable,
+                .allocating => {},
                 .free => live_reg_entry.value.* = .allocating,
             },
             .free => {},
@@ -12145,11 +12200,12 @@ pub const CallAbiIterator = struct {
                                 break :next_field_begin next_field_begin;
                             } else std.mem.alignForward(u64, size, 8);
                             while (next_field_begin - part_offset >= 8) {
-                                const part_size = field_end - part_offset;
+                                const part_size = @min(field_end - part_offset, 8);
                                 part_sizes[parts_len] = part_size;
                                 assert(part_offset + part_size <= size);
                                 parts_len += 1;
-                                part_offset = next_field_begin;
+                                part_offset += part_size;
+                                if (part_offset >= field_end) part_offset = next_field_begin;
                             }
                         }
                         assert(parts_len == part_sizes.len);
