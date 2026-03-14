@@ -1,147 +1,187 @@
-![ZIG](https://ziglang.org/img/zig-logo-dynamic.svg)
+# Zag
 
-A general-purpose programming language and toolchain for maintaining
-**robust**, **optimal**, and **reusable** software.
+Zag is a fork of Zig 0.15.2 focused on a different concurrency model.
 
-https://ziglang.org/
+The short version: Zag is exploring zero-infection structured concurrency.
+That means concurrency should live at the call site, not in function
+signatures. We do not want `async fn` coloring, and we do not want an `Io`
+parameter threaded through every layer of a program just because some leaf
+needs to block.
 
-## Documentation
+The current design direction is tracked in [issue #1](https://github.com/justrach/zag/issues/1):
+ZEP-0002 Structured Async.
 
-If you are looking at this README file in a source tree, please refer to the
-**Release Notes**, **Language Reference**, or **Standard Library
-Documentation** corresponding to the version of Zig that you are using by
-following the appropriate link on the
-[download page](https://ziglang.org/download).
+## Why Zag Exists
 
-Otherwise, you're looking at a release of Zig, so you can find the language
-reference at `doc/langref.html`, and the standard library documentation by
-running `zig std`, which will open a browser tab.
+Zag exists to test a language and runtime thesis:
 
-## Installation
+- Functions should stay plain functions.
+- Concurrency should be introduced by spawning work, opening a scope, or
+  waiting on a channel at the call site.
+- Cancellation should be runtime state, not parameter infection.
+- Structured concurrency should be the default, not an afterthought.
+- The compiler and toolchain should support this direction directly, rather
+  than forcing application code to simulate it with ceremony.
 
- * [download a pre-built binary](https://ziglang.org/download/)
- * [install from a package manager](https://github.com/ziglang/zig/wiki/Install-Zig-from-a-Package-Manager)
- * [bootstrap zig for any target](https://github.com/ziglang/zig-bootstrap)
+The motivating argument is laid out in the early design issues:
 
-A Zig installation is composed of two things:
+- [#1](https://github.com/justrach/zag/issues/1) tracks ZEP-0002 and the core
+  fiber-based structured async proposal.
+- [#3](https://github.com/justrach/zag/issues/3) documents the practical cost
+  of function coloring, drawing on systems like Codex, Symphony, and opencode.
+- [#4](https://github.com/justrach/zag/issues/4) tracks the Phase 1 runtime:
+  fibers plus a work-stealing scheduler.
 
-1. The Zig executable
-2. The lib/ directory
+The design position is straightforward:
 
-At runtime, the executable searches up the file system for the lib/ directory,
-relative to itself:
+- Zig upstream is moving toward explicit I/O capability passing.
+- Zag is intentionally exploring the opposite direction.
+- We want a stackful, fiber-oriented model that preserves direct style and
+  keeps APIs reusable.
 
-* lib/
-* lib/zig/
-* ../lib/
-* ../lib/zig/
-* (and so on)
+## Current Direction
 
-In other words, you can **unpack a release of Zig anywhere**, and then begin
-using it immediately. There is no need to install it globally, although this
-mechanism supports that use case too (i.e. `/usr/bin/zig` and `/usr/lib/zig/`).
+Zag is currently a forked compiler/toolchain based on Zig 0.15.2.
 
-## Building from Source
+The repo is in a transition state:
 
-Ensure you have the required dependencies:
+- the codebase was refreshed onto the upstream 0.15.2 compiler sources
+- Zag-specific compiler work is being reapplied on top of that base
+- the runtime model proposed in ZEP-0002 is not fully implemented yet
+- some macOS ARM64 self-hosted backend work is still in progress
 
- * CMake >= 3.15
- * System C/C++ Toolchain
- * LLVM, Clang, LLD development libraries == 20.x
+So this is not a finished language release. It is an active fork being shaped
+around a specific concurrency agenda.
 
-Then it is the standard CMake build process:
+## What Has Landed So Far
 
+Two user-visible changes are already in the tree:
+
+- `.zag` source files are accepted alongside `.zig`
+- the CLI and formatter know about `.zag`
+
+That means the compiler currently accepts both:
+
+- `.zig`
+- `.zag`
+
+The goal of `.zag` support right now is transitional compatibility while the
+language and runtime direction are being worked out.
+
+## Planned Model
+
+The current proposal in issue `#1` is centered on:
+
+- fibers rather than stackless async coloring
+- structured scopes for task lifetime management
+- work-stealing scheduling across worker threads
+- cancellation without parameter threading
+- a single-thread fallback for constrained or test contexts
+
+In other words, Zag is trying to preserve Zig-style direct code while gaining
+modern structured concurrency semantics.
+
+## Status
+
+What works today:
+
+- the compiler builds on the refreshed 0.15.2 base
+- `.zag` root files compile
+- LLVM-enabled macOS builds work with the Homebrew Polly flag described below
+
+What is still incomplete:
+
+- the Phase 1 fiber runtime from issue `#4`
+- full end-to-end validation of the non-LLVM macOS ARM64 backend path
+- proper public language/runtime documentation for the Zag-specific model
+- release packaging and a polished install story
+
+The main tracked backend blocker right now is:
+
+- [#13](https://github.com/justrach/zag/issues/13) macOS ARM64 standalone
+  simple suite hitting AArch64 codegen failures on the 0.15.2 baseline
+
+## Building Zag
+
+Zag currently builds from source. There is not yet a polished binary release
+channel specific to Zag.
+
+The current tree identifies itself against Zig 0.15.2 in `build.zig`. 
+
+A typical development build is:
+
+```sh
+zig build -Dno-lib -Dno-langref
 ```
-mkdir build
-cd build
-cmake ..
-make install
+
+If you want the LLVM-enabled path on macOS with Homebrew LLVM/LLD, the tree now
+supports an explicit Polly flag:
+
+```sh
+zig build \
+  -Denable-llvm=true \
+  -Dllvm-has-polly=true \
+  --search-prefix /opt/homebrew/opt/llvm@20 \
+  --search-prefix /opt/homebrew/opt/lld@20
 ```
 
-For more options, tips, and troubleshooting, please see the
-[Building Zig From Source](https://github.com/ziglang/zig/wiki/Building-Zig-From-Source)
-page on the wiki.
+That `-Dllvm-has-polly=true` option exists because Homebrew's LLVM packaging on
+macOS needs extra help when linking the system LLVM stack.
 
-## Building from Source without LLVM
+## Using `.zag`
 
-In this case, the only system dependency is a C compiler.
+The compiler currently treats `.zag` as Zag source code and routes it through
+the same source pipeline as `.zig`.
 
+Examples:
+
+```sh
+zig build-exe hello.zag
+zig test math.zag
+zig fmt src/
 ```
-cc -o bootstrap bootstrap.c
-./bootstrap
-```
 
-This produces a `zig2` executable in the current working directory. This is a
-"stage2" build of the compiler,
-[without LLVM extensions](https://github.com/ziglang/zig/issues/16270), and is
-therefore lacking these features:
-- Release mode optimizations
-- [aarch64 machine code backend](https://github.com/ziglang/zig/issues/21172)
-- [@cImport](https://github.com/ziglang/zig/issues/20630)
-- [zig translate-c](https://github.com/ziglang/zig/issues/20875)
-- [Ability to compile assembly files](https://github.com/ziglang/zig/issues/21169)
-- [Some ELF linking features](https://github.com/ziglang/zig/issues/17749)
-- [Most COFF/PE linking features](https://github.com/ziglang/zig/issues/17751)
-- [Some WebAssembly linking features](https://github.com/ziglang/zig/issues/17750)
-- [Ability to create import libs from def files](https://github.com/ziglang/zig/issues/17807)
-- [Ability to create static archives from object files](https://github.com/ziglang/zig/issues/9828)
-- Ability to compile C, C++, Objective-C, and Objective-C++ files
+The formatter, import handling, and file classification have already been wired
+so `.zag` and `.zig` can coexist during the transition.
 
-However, a compiler built this way does provide a C backend, which may be
-useful for creating system packages of Zig projects using the system C
-toolchain. **In this case, LLVM is not needed!**
+## Repository Shape
 
-Furthermore, a compiler built this way provides an LLVM backend that produces
-bitcode files, which may be compiled into object files via a system Clang
-package. This can be used to produce system packages of Zig applications
-without the Zig package dependency on LLVM.
+This repository is still mostly upstream Zig compiler source plus targeted Zag
+changes.
+
+That is intentional for now. The goal is to keep rebasing possible while the
+fork proves out the runtime and language direction.
+
+You should read the repo as:
+
+- upstream Zig 0.15.2 base
+- plus Zag-specific compiler behavior
+- plus ongoing runtime/backend experiments needed to support the model
 
 ## Contributing
 
-[Donate monthly](https://ziglang.org/zsf/).
+If you want to work on Zag, the most important thing is to understand the design
+intent before changing compiler code.
 
-Zig is Free and Open Source Software. We welcome bug reports and patches from
-everyone. However, keep in mind that Zig governance is BDFN (Benevolent
-Dictator For Now) which means that Andrew Kelley has final say on the design
-and implementation of everything.
+Start here:
 
-One of the best ways you can contribute to Zig is to start using it for an
-open-source personal project.
+- [#1](https://github.com/justrach/zag/issues/1) for the structured async thesis
+- [#3](https://github.com/justrach/zag/issues/3) for the argument against
+  function coloring
+- [#4](https://github.com/justrach/zag/issues/4) for the runtime implementation
+  roadmap
+- [#12](https://github.com/justrach/zag/issues/12) for the preserved pre-refresh
+  branch context
+- [#13](https://github.com/justrach/zag/issues/13) for the current macOS ARM64
+  backend blocker
 
-This leads to discovering bugs and helps flesh out use cases, which lead to
-further design iterations of Zig. Importantly, each issue found this way comes
-with real world motivations, making it straightforward to explain the reasoning
-behind proposals and feature requests.
+Contributions are most useful when they align with that agenda rather than
+pushing Zag back toward upstream Zig's concurrency model.
 
-You will be taken much more seriously on the issue tracker if you have a
-personal project that uses Zig.
+## Summary
 
-The issue label
-[Contributor Friendly](https://github.com/ziglang/zig/issues?q=is%3Aissue+is%3Aopen+label%3A%22contributor+friendly%22)
-exists to help you find issues that are **limited in scope and/or knowledge of
-Zig internals.**
+Zag is not trying to be "Zig with a different file extension".
 
-Please note that issues labeled
-[Proposal](https://github.com/ziglang/zig/issues?q=is%3Aissue+is%3Aopen+label%3Aproposal)
-but do not also have the
-[Accepted](https://github.com/ziglang/zig/issues?q=is%3Aissue+is%3Aopen+label%3Aaccepted)
-label are still under consideration, and efforts to implement such a proposal
-have a high risk of being wasted. If you are interested in a proposal which is
-still under consideration, please express your interest in the issue tracker,
-providing extra insights and considerations that others have not yet expressed.
-The most highly regarded argument in such a discussion is a real world use case.
-
-For more tips, please see the
-[Contributing](https://github.com/ziglang/zig/wiki/Contributing) page on the
-wiki.
-
-## Community
-
-The Zig community is decentralized. Anyone is free to start and maintain their
-own space for Zig users to gather. There is no concept of "official" or
-"unofficial". Each gathering place has its own moderators and rules. Users are
-encouraged to be aware of the social structures of the spaces they inhabit, and
-work purposefully to facilitate spaces that align with their values.
-
-Please see the [Community](https://github.com/ziglang/zig/wiki/Community) wiki
-page for a public listing of social spaces.
+Zag is a fork of Zig pursuing a different answer to async and concurrency:
+plain functions, structured scopes, fiber-based scheduling, and a toolchain that
+accepts `.zag` while that model is being built out.
