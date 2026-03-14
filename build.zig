@@ -165,6 +165,7 @@ pub fn build(b: *std.Build) !void {
             },
             .blank_extensions = &[_][]const u8{
                 "test.zig",
+                "test.zag",
             },
         });
     }

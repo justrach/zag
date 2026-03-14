@@ -7566,7 +7566,7 @@ pub fn classifyFileExt(filename: []const u8) FileExt {
         return .assembly;
     } else if (mem.endsWith(u8, filename, ".S")) {
         return .assembly_with_cpp;
-    } else if (mem.endsWith(u8, filename, ".zig")) {
+    } else if (mem.endsWith(u8, filename, ".zig") or mem.endsWith(u8, filename, ".zag")) {
         return .zig;
     } else if (hasSharedLibraryExt(filename)) {
         return .shared_library;

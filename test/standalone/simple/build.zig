@@ -90,6 +90,10 @@ const cases = [_]Case{
         .all_modes = true,
     },
     .{
+        .src_path = "hello_world/hello.zag",
+        .all_modes = true,
+    },
+    .{
         .src_path = "hello_world/hello_libc.zig",
         .link_libc = true,
         .all_modes = true,

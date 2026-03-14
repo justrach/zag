@@ -1997,6 +1997,7 @@ pub fn doImport(
         }
     }
     if (!std.mem.endsWith(u8, import_string, ".zig") and
+        !std.mem.endsWith(u8, import_string, ".zag") and
         !std.mem.endsWith(u8, import_string, ".zon"))
     {
         return error.ModuleNotFound;

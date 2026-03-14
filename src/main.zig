@@ -403,6 +403,7 @@ const usage_build_generic =
     \\
     \\Supported file types:
     \\                         .zig    Zig source code
+    \\                         .zag    Zag source code
     \\                           .o    ELF object file
     \\                           .o    Mach-O (macOS) object file
     \\                           .o    WebAssembly object file
