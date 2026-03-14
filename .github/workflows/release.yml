@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to build and upload assets for
+        required: true
+        default: zag-0.15.2
+  push:
+    tags:
+      - 'zag-*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            runs_on: macos-14
+            archive_name: zag-aarch64-macos-0.15.2.tar.xz
+            dist_dir: zag-aarch64-macos-0.15.2
+            zig_url: https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
+            zig_archive: zig-host.tar.xz
+            zig_dir: zig-aarch64-macos-0.15.2
+            shell: bash
+            build_cmd: |
+              brew install llvm@20 lld@20
+              export PATH="$PWD/$ZIG_DIR:$PATH"
+              zig build --release=fast -Denable-llvm=true -Dllvm-has-polly=true --search-prefix /opt/homebrew/opt/llvm@20 --search-prefix /opt/homebrew/opt/lld@20 --prefix "$PWD/out/$DIST_DIR"
+              tar -C "$PWD/out" -cJf "$PWD/$ARCHIVE_NAME" "$DIST_DIR"
+          - name: macos-x86_64
+            runs_on: macos-13
+            archive_name: zag-x86_64-macos-0.15.2.tar.xz
+            dist_dir: zag-x86_64-macos-0.15.2
+            zig_url: https://ziglang.org/download/0.15.2/zig-x86_64-macos-0.15.2.tar.xz
+            zig_archive: zig-host.tar.xz
+            zig_dir: zig-x86_64-macos-0.15.2
+            shell: bash
+            build_cmd: |
+              brew install llvm@20 lld@20
+              export PATH="$PWD/$ZIG_DIR:$PATH"
+              zig build --release=fast -Denable-llvm=true -Dllvm-has-polly=true --search-prefix /usr/local/opt/llvm@20 --search-prefix /usr/local/opt/lld@20 --prefix "$PWD/out/$DIST_DIR"
+              tar -C "$PWD/out" -cJf "$PWD/$ARCHIVE_NAME" "$DIST_DIR"
+          - name: linux-x86_64
+            runs_on: ubuntu-24.04
+            archive_name: zag-x86_64-linux-0.15.2.tar.xz
+            dist_dir: zag-x86_64-linux-0.15.2
+            zig_url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+            zig_archive: zig-host.tar.xz
+            zig_dir: zig-x86_64-linux-0.15.2
+            shell: bash
+            build_cmd: |
+              sudo apt-get update
+              sudo apt-get install -y clang lld cmake ninja-build llvm-20-dev lld-20 libclang-20-dev
+              export PATH="$PWD/$ZIG_DIR:$PATH"
+              zig build --release=fast -Denable-llvm=true --search-prefix /usr/lib/llvm-20 --prefix "$PWD/out/$DIST_DIR"
+              tar -C "$PWD/out" -cJf "$PWD/$ARCHIVE_NAME" "$DIST_DIR"
+          - name: windows-x86_64
+            runs_on: windows-2022
+            archive_name: zag-x86_64-windows-0.15.2.zip
+            dist_dir: zag-x86_64-windows-0.15.2
+            zig_url: https://ziglang.org/download/0.15.2/zig-x86_64-windows-0.15.2.zip
+            zig_archive: zig-host.zip
+            zig_dir: zig-x86_64-windows-0.15.2
+            shell: pwsh
+            build_cmd: |
+              choco install -y llvm
+              $env:PATH = "$PWD\$env:ZIG_DIR;$env:PATH"
+              zig build --release=fast -Denable-llvm=true --search-prefix "C:\Program Files\LLVM" --prefix "$PWD\out\$env:DIST_DIR"
+              Compress-Archive -Path "$PWD\out\$env:DIST_DIR" -DestinationPath "$PWD\$env:ARCHIVE_NAME"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download host Zig
+        shell: bash
+        run: |
+          curl -L "$ZIG_URL" -o "$ZIG_ARCHIVE"
+          case "$ZIG_ARCHIVE" in
+            *.zip) unzip -q "$ZIG_ARCHIVE" ;;
+            *.tar.xz) tar -xf "$ZIG_ARCHIVE" ;;
+            *) echo "Unsupported host Zig archive: $ZIG_ARCHIVE"; exit 1 ;;
+          esac
+        env:
+          ZIG_URL: ${{ matrix.zig_url }}
+          ZIG_ARCHIVE: ${{ matrix.zig_archive }}
+
+      - name: Build release archive
+        shell: ${{ matrix.shell }}
+        run: ${{ matrix.build_cmd }}
+        env:
+          ZIG_DIR: ${{ matrix.zig_dir }}
+          DIST_DIR: ${{ matrix.dist_dir }}
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" "${{ matrix.archive_name }}" --clobber
