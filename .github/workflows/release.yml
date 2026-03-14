@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  COMPILER_MAX_RSS: '7300000000'
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -29,22 +33,26 @@ jobs:
             zig_url: https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
             zig_archive: zig-host.tar.xz
             zig_dir: zig-aarch64-macos-0.15.2
-            build_cmd: |
+            use_windows_archive: false
+            setup_cmd: |
               brew install llvm@20 lld@20
+            build_cmd: |
               export PATH="$PWD/$ZIG_DIR:$PATH"
-              zig build --release=fast -Denable-llvm=true -Dllvm-has-polly=true --search-prefix /opt/homebrew/opt/llvm@20 --search-prefix /opt/homebrew/opt/lld@20 --prefix "$PWD/out/$DIST_DIR"
+              zig build --release=fast -Dstrip=true -Dno-langref=true -Denable-llvm=true --search-prefix /opt/homebrew/opt/llvm@20 --search-prefix /opt/homebrew/opt/lld@20 -Dcompiler-max-rss=$COMPILER_MAX_RSS --prefix "$PWD/out/$DIST_DIR" --maxrss $COMPILER_MAX_RSS -j1
               tar -C "$PWD/out" -cJf "$PWD/$ARCHIVE_NAME" "$DIST_DIR"
           - name: macos-x86_64
-            runs_on: macos-13
+            runs_on: macos-15-intel
             archive_name: zag-x86_64-macos-0.15.2.tar.xz
             dist_dir: zag-x86_64-macos-0.15.2
             zig_url: https://ziglang.org/download/0.15.2/zig-x86_64-macos-0.15.2.tar.xz
             zig_archive: zig-host.tar.xz
             zig_dir: zig-x86_64-macos-0.15.2
-            build_cmd: |
+            use_windows_archive: false
+            setup_cmd: |
               brew install llvm@20 lld@20
+            build_cmd: |
               export PATH="$PWD/$ZIG_DIR:$PATH"
-              zig build --release=fast -Denable-llvm=true -Dllvm-has-polly=true --search-prefix /usr/local/opt/llvm@20 --search-prefix /usr/local/opt/lld@20 --prefix "$PWD/out/$DIST_DIR"
+              zig build --release=fast -Dstrip=true -Dno-langref=true -Denable-llvm=true --search-prefix /usr/local/opt/llvm@20 --search-prefix /usr/local/opt/lld@20 -Dcompiler-max-rss=$COMPILER_MAX_RSS --prefix "$PWD/out/$DIST_DIR" --maxrss $COMPILER_MAX_RSS -j1
               tar -C "$PWD/out" -cJf "$PWD/$ARCHIVE_NAME" "$DIST_DIR"
           - name: linux-x86_64
             runs_on: ubuntu-24.04
@@ -53,11 +61,15 @@ jobs:
             zig_url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
             zig_archive: zig-host.tar.xz
             zig_dir: zig-x86_64-linux-0.15.2
-            build_cmd: |
+            use_windows_archive: false
+            setup_cmd: |
+              wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+              echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list >/dev/null
               sudo apt-get update
-              sudo apt-get install -y clang lld cmake ninja-build llvm-20-dev lld-20 libclang-20-dev
+              sudo apt-get install -y clang-20 lld-20 liblld-20-dev llvm-20-dev libclang-20-dev cmake ninja-build
+            build_cmd: |
               export PATH="$PWD/$ZIG_DIR:$PATH"
-              zig build --release=fast -Denable-llvm=true --search-prefix /usr/lib/llvm-20 --prefix "$PWD/out/$DIST_DIR"
+              zig build --release=fast -Dstrip=true -Dno-langref=true -Denable-llvm=true --search-prefix /usr/lib/llvm-20 -Dcompiler-max-rss=$COMPILER_MAX_RSS --prefix "$PWD/out/$DIST_DIR" --maxrss $COMPILER_MAX_RSS -j1
               tar -C "$PWD/out" -cJf "$PWD/$ARCHIVE_NAME" "$DIST_DIR"
           - name: windows-x86_64
             runs_on: windows-2022
@@ -66,10 +78,14 @@ jobs:
             zig_url: https://ziglang.org/download/0.15.2/zig-x86_64-windows-0.15.2.zip
             zig_archive: zig-host.zip
             zig_dir: zig-x86_64-windows-0.15.2
+            use_windows_archive: true
+            setup_cmd: |
+              curl -L https://ziglang.org/deps/llvm+clang+lld-20.1.0-x86_64-windows-gnu.tar.xz -o llvm-static.tar.xz
+              tar -xf llvm-static.tar.xz
+              mv llvm+clang+lld-20.1.0-x86_64-windows-gnu llvm-static
             build_cmd: |
-              choco install -y llvm
-              export PATH="$PWD/$ZIG_DIR:/c/Program Files/LLVM/bin:$PATH"
-              zig build --release=fast -Denable-llvm=true --search-prefix "C:\Program Files\LLVM" --prefix "$PWD/out/$DIST_DIR"
+              export PATH="$PWD/$ZIG_DIR:$PATH"
+              zig build --release=fast -Dstrip=true -Dno-langref=true -Denable-llvm=true --search-prefix "$PWD/llvm-static" -Dcompiler-max-rss=$COMPILER_MAX_RSS --prefix "$PWD/out/$DIST_DIR" --maxrss $COMPILER_MAX_RSS -j1
               powershell -NoProfile -Command "Compress-Archive -Path '$PWD/out/$DIST_DIR' -DestinationPath '$PWD/$ARCHIVE_NAME'"
 
     steps:
@@ -99,6 +115,10 @@ jobs:
           ZIG_URL: ${{ matrix.zig_url }}
           ZIG_ARCHIVE: ${{ matrix.zig_archive }}
 
+      - name: Set up platform dependencies
+        shell: bash
+        run: ${{ matrix.setup_cmd }}
+
       - name: Build release archive
         if: runner.os != 'Windows'
         shell: bash
@@ -107,6 +127,7 @@ jobs:
           ZIG_DIR: ${{ matrix.zig_dir }}
           DIST_DIR: ${{ matrix.dist_dir }}
           ARCHIVE_NAME: ${{ matrix.archive_name }}
+          COMPILER_MAX_RSS: ${{ env.COMPILER_MAX_RSS }}
 
       - name: Build release archive (Windows)
         if: runner.os == 'Windows'
@@ -116,6 +137,8 @@ jobs:
           ZIG_DIR: ${{ matrix.zig_dir }}
           DIST_DIR: ${{ matrix.dist_dir }}
           ARCHIVE_NAME: ${{ matrix.archive_name }}
+          COMPILER_MAX_RSS: ${{ env.COMPILER_MAX_RSS }}
+
       - name: Upload release asset
         env:
           GH_TOKEN: ${{ github.token }}

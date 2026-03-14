@@ -190,6 +190,7 @@ pub fn build(b: *std.Build) !void {
     const strip = b.option(bool, "strip", "Omit debug information");
     const valgrind = b.option(bool, "valgrind", "Enable valgrind integration");
     const pie = b.option(bool, "pie", "Produce a Position Independent Executable");
+    const compiler_max_rss = b.option(usize, "compiler-max-rss", "Override the compiler build step max RSS in bytes") orelse 7_800_000_000;
     const value_interpret_mode = b.option(ValueInterpretMode, "value-interpret-mode", "How the compiler translates between 'std.builtin' types and its internal datastructures") orelse .direct;
     const value_tracing = b.option(bool, "value-tracing", "Enable extra state tracking to help troubleshoot bugs in the compiler (using the std.debug.Trace API)") orelse false;
 
@@ -198,10 +199,10 @@ pub fn build(b: *std.Build) !void {
         if (optimize != .Debug) break :blk 0;
         break :blk 4;
     };
-
     const exe = addCompilerStep(b, .{
         .optimize = optimize,
         .target = target,
+        .max_rss = compiler_max_rss,
         .strip = strip,
         .valgrind = valgrind,
         .sanitize_thread = sanitize_thread,
@@ -714,6 +715,7 @@ fn addWasiUpdateStep(b: *std.Build, version: [:0]const u8) !void {
 const AddCompilerModOptions = struct {
     optimize: std.builtin.OptimizeMode,
     target: std.Build.ResolvedTarget,
+    max_rss: usize = 7_800_000_000,
     strip: ?bool = null,
     valgrind: ?bool = null,
     sanitize_thread: ?bool = null,
@@ -745,11 +747,10 @@ fn addCompilerMod(b: *std.Build, options: AddCompilerModOptions) *std.Build.Modu
 
     return compiler_mod;
 }
-
 fn addCompilerStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "zig",
-        .max_rss = 7_800_000_000,
+        .max_rss = options.max_rss,
         .root_module = addCompilerMod(b, options),
     });
     exe.stack_size = stack_size;
