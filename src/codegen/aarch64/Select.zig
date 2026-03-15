@@ -974,7 +974,36 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) error{ OutOfMemory,
                         try arg_part.defLiveIn(isel, arg_part.hint(isel).?, comptime &.initFill(.free));
                     }
                 },
-                .stack_slot => {},
+                .stack_slot => |stack_slot| if (stack_slot.base == Register.Alias.fp) {
+                    // Genuine caller-stack-passed arg (fp-relative save area).
+                    // Release any callee-saved register this arg was materialized into.
+                    if (arg_vi.register(isel)) |ra| {
+                        arg_vi.get(isel).location_payload.small.register = .zr;
+                        const live_vi = isel.live_registers.getPtr(ra);
+                        if (live_vi.* == arg_vi) live_vi.* = .free;
+                    }
+                    var part_it = arg_vi.parts(isel);
+                    if (part_it.only() == null) while (part_it.next()) |part_vi| {
+                        if (part_vi.register(isel)) |ra| {
+                            part_vi.get(isel).location_payload.small.register = .zr;
+                            const live_vi = isel.live_registers.getPtr(ra);
+                            if (live_vi.* == part_vi) live_vi.* = .free;
+                        }
+                    };
+                } else {
+                    // Register-passed arg spilled to a local sp-relative stack slot
+                    // (by fillMemory during body processing). The slot was allocated but
+                    // never written; emit the initial store from the ABI register now,
+                    // exactly as the .unallocated case does via defLiveIn.
+                    if (arg_vi.hint(isel)) |arg_ra| {
+                        try arg_vi.defLiveIn(isel, arg_ra, comptime &.initFill(.free));
+                    } else {
+                        var arg_part_it = arg_vi.parts(isel);
+                        while (arg_part_it.next()) |arg_part| {
+                            try arg_part.defLiveIn(isel, arg_part.hint(isel).?, comptime &.initFill(.free));
+                        }
+                    }
+                },
                 .value, .constant => unreachable,
                 .address => |address_vi| try address_vi.defLiveIn(isel, address_vi.hint(isel).?, comptime &.initFill(.free)),
             }
@@ -2664,6 +2693,229 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) error{ OutOfMemory,
                 }, rhs_vi, .{
                     .overflow = if (try overflow_vi.?.defReg(isel)) |overflow_ra| .{ .ra = overflow_ra } else .wrap,
                 });
+            }
+            if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
+        },
+        .mul_with_overflow => {
+            if (isel.live_values.fetchRemove(air.inst_index)) |res_vi| {
+                defer res_vi.value.deref(isel);
+
+                const ty_pl = air.data(air.inst_index).ty_pl;
+                const bin_op = isel.air.extraData(Air.Bin, ty_pl.payload).data;
+                const ty = isel.air.typeOf(bin_op.lhs, ip);
+                const lhs_vi = try isel.use(bin_op.lhs);
+                const rhs_vi = try isel.use(bin_op.rhs);
+                const ty_size = lhs_vi.size(isel);
+                var overflow_it = res_vi.value.field(ty_pl.ty.toType(), ty_size, 1);
+                const overflow_vi = try overflow_it.only(isel);
+                var wrapped_it = res_vi.value.field(ty_pl.ty.toType(), 0, ty_size);
+                const wrapped_vi = try wrapped_it.only(isel);
+                if (!ty.isAbiInt(zcu)) return isel.fail("bad mul_with_overflow {f}", .{isel.fmtType(ty)});
+                const int_info = ty.intInfo(zcu);
+                const maybe_ov_ra = try overflow_vi.?.defReg(isel);
+                // Protect ov_ra from being recycled when defReg'ing the wrapped result.
+                const maybe_res_ra = blk: {
+                    const ov_lock: RegLock = if (maybe_ov_ra) |ra| isel.lockReg(ra) else .empty;
+                    defer ov_lock.unlock(isel);
+                    break :blk try wrapped_vi.?.defReg(isel);
+                };
+                switch (int_info.signedness) {
+                    .unsigned => switch (int_info.bits) {
+                        0 => unreachable,
+                        1 => {
+                            // u1*u1 never overflows (1*1=1 which fits in u1)
+                            const lhs_mat = try lhs_vi.matReg(isel);
+                            const rhs_mat = try rhs_vi.matReg(isel);
+                            if (maybe_res_ra) |res_ra|
+                                try isel.emit(.@"and"(res_ra.w(), lhs_mat.ra.w(), .{ .register = rhs_mat.ra.w() }));
+                            if (maybe_ov_ra) |ov_ra|
+                                try isel.emit(.orr(ov_ra.w(), .wzr, .{ .register = .wzr }));
+                            try rhs_mat.finish(isel);
+                            try lhs_mat.finish(isel);
+                        },
+                        2...32 => |bits| {
+                            // 32×32 → 64-bit unsigned product; overflow if upper (64-bits) bits nonzero.
+                            const prod_ra = maybe_res_ra orelse blk: {
+                                const ov_lock: RegLock = if (maybe_ov_ra) |ra| isel.lockReg(ra) else .empty;
+                                defer ov_lock.unlock(isel);
+                                break :blk try isel.allocIntReg();
+                            };
+                            defer if (maybe_res_ra == null) isel.freeReg(prod_ra);
+                            const lhs_mat = try lhs_vi.matReg(isel);
+                            const rhs_mat = try rhs_vi.matReg(isel);
+                            // Reverse-emission order: mask (last) → ov flag → test → multiply (first)
+                            if (maybe_res_ra != null and bits < 32)
+                                try isel.emit(.ubfm(prod_ra.w(), prod_ra.w(), .{
+                                    .N = .word,
+                                    .immr = 0,
+                                    .imms = @intCast(bits - 1),
+                                }));
+                            if (maybe_ov_ra) |ov_ra| {
+                                try isel.emit(.csinc(ov_ra.w(), .wzr, .wzr, .eq));
+                                // Test if any bits above position (bits-1) are set in the 64-bit product.
+                                // Mask: immr=bits, imms=63-bits encodes ones at bits..63.
+                                try isel.emit(.ands(.xzr, prod_ra.x(), .{ .immediate = .{
+                                    .N = .doubleword,
+                                    .immr = @intCast(bits),
+                                    .imms = @intCast(63 - bits),
+                                } }));
+                            }
+                            try isel.emit(.umaddl(prod_ra.x(), lhs_mat.ra.w(), rhs_mat.ra.w(), .xzr));
+                            try rhs_mat.finish(isel);
+                            try lhs_mat.finish(isel);
+                        },
+                        33...63 => |bits| {
+                            const lo_ra = maybe_res_ra orelse blk: {
+                                const ov_lock: RegLock = if (maybe_ov_ra) |ra| isel.lockReg(ra) else .empty;
+                                defer ov_lock.unlock(isel);
+                                break :blk try isel.allocIntReg();
+                            };
+                            defer if (maybe_res_ra == null) isel.freeReg(lo_ra);
+                            const hi_ra = blk: {
+                                const lo_lock = isel.tryLockReg(lo_ra);
+                                defer lo_lock.unlock(isel);
+                                const ov_lock: RegLock = if (maybe_ov_ra) |ra| isel.lockReg(ra) else .empty;
+                                defer ov_lock.unlock(isel);
+                                break :blk try isel.allocIntReg();
+                            };
+                            defer isel.freeReg(hi_ra);
+                            const lhs_mat = try lhs_vi.matReg(isel);
+                            const rhs_mat = try rhs_vi.matReg(isel);
+                            if (maybe_res_ra != null)
+                                try isel.emit(.ubfm(lo_ra.x(), lo_ra.x(), .{
+                                    .N = .doubleword,
+                                    .immr = 0,
+                                    .imms = @intCast(bits - 1),
+                                }));
+                            if (maybe_ov_ra) |ov_ra| {
+                                try isel.emit(.csinc(ov_ra.w(), .wzr, .wzr, .eq));
+                                try isel.emit(.ands(.xzr, hi_ra.x(), .{ .register = hi_ra.x() }));
+                                // Combine: hi64 | (lo64 >> bits); nonzero means overflow
+                                try isel.emit(.orr(hi_ra.x(), hi_ra.x(), .{ .shifted_register = .{
+                                    .register = lo_ra.x(),
+                                    .shift = .{ .lsr = @intCast(bits) },
+                                } }));
+                            }
+                            try isel.emit(.madd(lo_ra.x(), lhs_mat.ra.x(), rhs_mat.ra.x(), .xzr));
+                            try isel.emit(.umulh(hi_ra.x(), lhs_mat.ra.x(), rhs_mat.ra.x()));
+                            try rhs_mat.finish(isel);
+                            try lhs_mat.finish(isel);
+                        },
+                        64 => {
+                            const lo_ra = maybe_res_ra orelse blk: {
+                                const ov_lock: RegLock = if (maybe_ov_ra) |ra| isel.lockReg(ra) else .empty;
+                                defer ov_lock.unlock(isel);
+                                break :blk try isel.allocIntReg();
+                            };
+                            defer if (maybe_res_ra == null) isel.freeReg(lo_ra);
+                            const hi_ra = blk: {
+                                const lo_lock = isel.tryLockReg(lo_ra);
+                                defer lo_lock.unlock(isel);
+                                const ov_lock: RegLock = if (maybe_ov_ra) |ra| isel.lockReg(ra) else .empty;
+                                defer ov_lock.unlock(isel);
+                                break :blk try isel.allocIntReg();
+                            };
+                            defer isel.freeReg(hi_ra);
+                            const lhs_mat = try lhs_vi.matReg(isel);
+                            const rhs_mat = try rhs_vi.matReg(isel);
+                            if (maybe_ov_ra) |ov_ra| {
+                                try isel.emit(.csinc(ov_ra.w(), .wzr, .wzr, .eq));
+                                try isel.emit(.ands(.xzr, hi_ra.x(), .{ .register = hi_ra.x() }));
+                            }
+                            try isel.emit(.madd(lo_ra.x(), lhs_mat.ra.x(), rhs_mat.ra.x(), .xzr));
+                            try isel.emit(.umulh(hi_ra.x(), lhs_mat.ra.x(), rhs_mat.ra.x()));
+                            try rhs_mat.finish(isel);
+                            try lhs_mat.finish(isel);
+                        },
+                        else => return isel.fail("unimplemented mul_with_overflow {f}", .{isel.fmtType(ty)}),
+                    },
+                    .signed => switch (int_info.bits) {
+                        0 => unreachable,
+                        1 => {
+                            // i1: -1*-1=1 overflows; both register values are 1 iff both inputs are -1
+                            const lhs_mat = try lhs_vi.matReg(isel);
+                            const rhs_mat = try rhs_vi.matReg(isel);
+                            if (maybe_res_ra) |res_ra|
+                                try isel.emit(.@"and"(res_ra.w(), lhs_mat.ra.w(), .{ .register = rhs_mat.ra.w() }));
+                            if (maybe_ov_ra) |ov_ra| {
+                                try isel.emit(.csinc(ov_ra.w(), .wzr, .wzr, .eq));
+                                try isel.emit(.ands(.wzr, lhs_mat.ra.w(), .{ .register = rhs_mat.ra.w() }));
+                            }
+                            try rhs_mat.finish(isel);
+                            try lhs_mat.finish(isel);
+                        },
+                        2...32 => |bits| {
+                            // smaddl gives exact 64-bit signed product; overflow if sbfm to N bits changes value.
+                            const prod_ra = maybe_res_ra orelse blk: {
+                                const ov_lock: RegLock = if (maybe_ov_ra) |ra| isel.lockReg(ra) else .empty;
+                                defer ov_lock.unlock(isel);
+                                break :blk try isel.allocIntReg();
+                            };
+                            defer if (maybe_res_ra == null) isel.freeReg(prod_ra);
+                            // Allocate sext_ra before materializing inputs so ov_ra can't be recycled by matReg.
+                            const maybe_sext_ra: ?Register.Alias = if (maybe_ov_ra) |ov_ra| blk: {
+                                const prod_lock = isel.tryLockReg(prod_ra);
+                                defer prod_lock.unlock(isel);
+                                const ov_lock = isel.lockReg(ov_ra);
+                                defer ov_lock.unlock(isel);
+                                break :blk try isel.allocIntReg();
+                            } else null;
+                            defer if (maybe_sext_ra) |sext_ra| isel.freeReg(sext_ra);
+                            const lhs_mat = try lhs_vi.matReg(isel);
+                            const rhs_mat = try rhs_vi.matReg(isel);
+                            if (maybe_res_ra != null and bits < 32)
+                                try isel.emit(.sbfm(prod_ra.w(), prod_ra.w(), .{
+                                    .N = .word,
+                                    .immr = 0,
+                                    .imms = @intCast(bits - 1),
+                                }));
+                            if (maybe_ov_ra) |ov_ra| {
+                                const sext_ra = maybe_sext_ra.?;
+                                try isel.emit(.csinc(ov_ra.w(), .wzr, .wzr, .eq));
+                                try isel.emit(.subs(.xzr, prod_ra.x(), .{ .register = sext_ra.x() }));
+                                try isel.emit(.sbfm(sext_ra.x(), prod_ra.x(), .{
+                                    .N = .doubleword,
+                                    .immr = 0,
+                                    .imms = @intCast(bits - 1),
+                                }));
+                            }
+                            try isel.emit(.smaddl(prod_ra.x(), lhs_mat.ra.w(), rhs_mat.ra.w(), .xzr));
+                            try rhs_mat.finish(isel);
+                            try lhs_mat.finish(isel);
+                        },
+                        33...64 => |bits| {
+                            // smulh gives high 64 bits; overflow if hi64 != ASR-extend of lo64[bits-1]
+                            const lo_ra = maybe_res_ra orelse blk: {
+                                const ov_lock: RegLock = if (maybe_ov_ra) |ra| isel.lockReg(ra) else .empty;
+                                defer ov_lock.unlock(isel);
+                                break :blk try isel.allocIntReg();
+                            };
+                            defer if (maybe_res_ra == null) isel.freeReg(lo_ra);
+                            const hi_ra = blk: {
+                                const lo_lock = isel.tryLockReg(lo_ra);
+                                defer lo_lock.unlock(isel);
+                                const ov_lock: RegLock = if (maybe_ov_ra) |ra| isel.lockReg(ra) else .empty;
+                                defer ov_lock.unlock(isel);
+                                break :blk try isel.allocIntReg();
+                            };
+                            defer isel.freeReg(hi_ra);
+                            const lhs_mat = try lhs_vi.matReg(isel);
+                            const rhs_mat = try rhs_vi.matReg(isel);
+                            if (maybe_ov_ra) |ov_ra| {
+                                try isel.emit(.csinc(ov_ra.w(), .wzr, .wzr, .eq));
+                                try isel.emit(.subs(.xzr, hi_ra.x(), .{ .shifted_register = .{
+                                    .register = lo_ra.x(),
+                                    .shift = .{ .asr = @intCast(bits - 1) },
+                                } }));
+                            }
+                            try isel.emit(.madd(lo_ra.x(), lhs_mat.ra.x(), rhs_mat.ra.x(), .xzr));
+                            try isel.emit(.smulh(hi_ra.x(), lhs_mat.ra.x(), rhs_mat.ra.x()));
+                            try rhs_mat.finish(isel);
+                            try lhs_mat.finish(isel);
+                        },
+                        else => return isel.fail("unimplemented mul_with_overflow {f}", .{isel.fmtType(ty)}),
+                    },
+                }
             }
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
@@ -10167,7 +10419,7 @@ pub const Value = struct {
                     else => return isel.fail("Value.FieldPartIterator.next({f})", .{isel.fmtType(ty)}),
                     .int_type => |int_type| switch (int_type.bits) {
                         0 => unreachable,
-                        1...64 => unreachable,
+                        1...64 => return isel.fail("Value.FieldPartIterator.next({f})", .{isel.fmtType(ty)}),
                         65...256 => |bits| if (offset == 0 and size == ty_size) {
                             const parts_len = std.math.divCeil(u16, bits, 64) catch unreachable;
                             vi.setParts(isel, @intCast(parts_len));
