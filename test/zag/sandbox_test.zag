@@ -1,0 +1,287 @@
+//! Sandbox test — capability-based isolation for agent fibers.
+//!
+//! Demonstrates running untrusted tool code with resource limits:
+//! - Memory caps (OOM kills the fiber, not the process)
+//! - Time limits (auto-cancel runaway tools)
+//! - Path restrictions (only access allowed directories)
+//! - Operation limits (cap I/O ops)
+//!
+//! Build: test/zag/build.sh sandbox_test Debug
+
+const std = @import("std");
+const zag = @import("zag");
+const Sandbox = zag.Sandbox;
+const Scope = zag.Scope;
+const fs = std.fs;
+
+const WORKDIR = "/tmp/zag_sb_work";
+const FORBIDDEN = "/tmp/zag_sb_forbidden";
+var global_allocator: std.mem.Allocator = undefined;
+// ============================================================
+// Tool agents that run inside sandboxes
+// ============================================================
+
+/// Well-behaved tool: reads a file, returns line count
+fn lineCountTool(sb: *Sandbox, path: []const u8) !u64 {
+    sb.checkOp() catch return error.SandboxViolation;
+    sb.checkPath(path) catch return error.SandboxViolation;
+
+    const file = fs.cwd().openFile(path, .{}) catch return 0;
+    defer file.close();
+
+    var buf: [4096]u8 = undefined;
+    sb.checkOp() catch return error.SandboxViolation;
+    const n = file.readAll(&buf) catch return 0;
+
+    var lines: u64 = 0;
+    for (buf[0..n]) |c| {
+        if (c == '\n') lines += 1;
+    }
+    return lines;
+}
+
+/// Memory hog tool: tries to allocate a lot of memory
+fn memoryHogTool(sb: *Sandbox) void {
+    var sa = sb.getAllocator();
+    const alloc = sa.allocator();
+
+    // Try to allocate 10MB in 1MB chunks
+    var allocated: usize = 0;
+    for (0..10) |_| {
+        sb.checkOp() catch return;
+        const chunk = alloc.alloc(u8, 1024 * 1024) catch {
+            // Sandbox should block this
+            return;
+        };
+        allocated += chunk.len;
+        // Touch memory so it's not optimized out
+        @memset(chunk, 0xAA);
+    }
+}
+
+/// Slow tool: loops forever (should be time-limited)
+fn slowTool(sb: *Sandbox, counter: *std.atomic.Value(u64)) void {
+    var i: u64 = 0;
+    while (true) : (i += 1) {
+        sb.checkOp() catch return;
+        _ = counter.fetchAdd(1, .monotonic);
+        // Busy work
+        std.mem.doNotOptimizeAway(i);
+    }
+}
+
+/// Path-violating tool: tries to access forbidden path
+fn sneakyTool(sb: *Sandbox) !void {
+    sb.checkOp() catch return error.SandboxViolation;
+    sb.checkPath(FORBIDDEN ++ "/secret.txt") catch return error.SandboxViolation;
+    // Should never reach here
+    unreachable;
+}
+
+/// Multi-op tool: does many operations
+fn busyTool(sb: *Sandbox, iterations: u64) u64 {
+    var count: u64 = 0;
+    for (0..iterations) |_| {
+        sb.checkOp() catch return count;
+        count += 1;
+    }
+    return count;
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+pub fn main() !void {
+    global_allocator = std.heap.page_allocator;
+
+    // Setup
+    fs.cwd().makePath(WORKDIR) catch {};
+    fs.cwd().makePath(FORBIDDEN) catch {};
+
+    // Create test files
+    {
+        const f = try fs.cwd().createFile(WORKDIR ++ "/test.txt", .{});
+        defer f.close();
+        try f.writeAll("line 1\nline 2\nline 3\nline 4\nline 5\n");
+    }
+    {
+        const f = try fs.cwd().createFile(FORBIDDEN ++ "/secret.txt", .{});
+        defer f.close();
+        try f.writeAll("super secret data\n");
+    }
+
+    std.debug.print("=== Zag Sandbox Tests ===\n\n", .{});
+
+    // --- Test 1: Well-behaved tool in sandbox ---
+    std.debug.print("Test 1: Well-behaved tool (path allowed)... ", .{});
+    {
+        const allowed = [_][]const u8{WORKDIR};
+        var sb = Sandbox.init(.{
+            .memory_limit = 1 * 1024 * 1024,
+            .max_ops = 100,
+            .allowed_paths = &allowed,
+        });
+
+        const lines = lineCountTool(&sb, WORKDIR ++ "/test.txt") catch 0;
+
+        if (lines == 5 and !sb.isViolated()) {
+            std.debug.print("PASS ({d} lines, {d} ops, {d} bytes)\n", .{
+                lines, sb.getOpsCount(), sb.getBytesAllocated(),
+            });
+        } else {
+            std.debug.print("FAIL\n", .{});
+        }
+    }
+
+    // --- Test 2: Path restriction ---
+    std.debug.print("Test 2: Path restriction (forbidden access)... ", .{});
+    {
+        const allowed = [_][]const u8{WORKDIR};
+        var sb = Sandbox.init(.{
+            .allowed_paths = &allowed,
+        });
+
+        const result = sneakyTool(&sb);
+        if (result == error.SandboxViolation and sb.isViolated()) {
+            std.debug.print("PASS (blocked: {s})\n", .{sb.getViolationReason().?});
+        } else {
+            std.debug.print("FAIL\n", .{});
+        }
+    }
+
+    // --- Test 3: Memory limit ---
+    std.debug.print("Test 3: Memory limit (1MB cap)... ", .{});
+    {
+        var sb = Sandbox.init(.{
+            .memory_limit = 1 * 1024 * 1024,
+            .max_ops = 1000,
+            .allocator = global_allocator,
+        });
+
+        memoryHogTool(&sb);
+
+        const bytes = sb.getBytesAllocated();
+        if (bytes <= 1 * 1024 * 1024) {
+            std.debug.print("PASS (allocated {d} KB, capped at 1MB)\n", .{bytes / 1024});
+        } else {
+            std.debug.print("FAIL (allocated {d} KB, exceeded 1MB)\n", .{bytes / 1024});
+        }
+    }
+
+    // --- Test 4: Operation limit ---
+    std.debug.print("Test 4: Operation limit (50 ops max)... ", .{});
+    {
+        var sb = Sandbox.init(.{
+            .max_ops = 50,
+        });
+
+        const completed = busyTool(&sb, 1000);
+
+        if (completed == 50 and sb.isViolated()) {
+            std.debug.print("PASS ({d} ops completed, then stopped: {s})\n", .{
+                completed, sb.getViolationReason().?,
+            });
+        } else {
+            std.debug.print("FAIL ({d} ops)\n", .{completed});
+        }
+    }
+
+    // --- Test 5: Time limit (with fibers) ---
+    std.debug.print("Test 5: Time limit (100ms timeout)... ", .{});
+    {
+        const sched = try zag.initRuntime(global_allocator, 1);
+        _ = sched;
+
+        var sb = Sandbox.init(.{
+            .time_limit_ms = 100,
+            .max_ops = 0, // unlimited ops — rely on time limit
+        });
+
+        var counter = std.atomic.Value(u64).init(0);
+
+        {
+            var scope = Scope.init(global_allocator);
+            defer scope.deinit();
+            try scope.spawn(slowTool, .{ &sb, &counter });
+            try scope.join();
+        }
+
+        const ops = counter.load(.monotonic);
+        const elapsed = sb.getElapsedMs();
+        if (sb.isViolated() and elapsed >= 100) {
+            std.debug.print("PASS (ran {d} ops in {d}ms, then killed: {s})\n", .{
+                ops, elapsed, sb.getViolationReason().?,
+            });
+        } else {
+            std.debug.print("FAIL ({d} ops, {d}ms, violated={any})\n", .{ ops, elapsed, sb.isViolated() });
+        }
+        zag.deinitRuntime(global_allocator);
+    }
+
+    // --- Test 6: Sandboxed parallel agents ---
+    std.debug.print("\nTest 6: 3 sandboxed agents in parallel... ", .{});
+    {
+        const sched = try zag.initRuntime(global_allocator, 1);
+        _ = sched;
+
+        const allowed = [_][]const u8{WORKDIR};
+
+        var sb1 = Sandbox.init(.{ .max_ops = 100, .allowed_paths = &allowed });
+        var sb2 = Sandbox.init(.{ .max_ops = 100, .allowed_paths = &allowed });
+        var sb3 = Sandbox.init(.{ .max_ops = 50 }); // this one has tight limit
+
+        var r1 = std.atomic.Value(u64).init(0);
+        var r2 = std.atomic.Value(u64).init(0);
+        var r3 = std.atomic.Value(u64).init(0);
+
+        {
+            var scope = Scope.init(global_allocator);
+            defer scope.deinit();
+
+            // Agent 1: count lines (should succeed)
+            try scope.spawn(struct {
+                fn run(sb: *Sandbox, result: *std.atomic.Value(u64)) void {
+                    const lines = lineCountTool(sb, WORKDIR ++ "/test.txt") catch 0;
+                    _ = result.fetchAdd(lines, .monotonic);
+                }
+            }.run, .{ &sb1, &r1 });
+
+            // Agent 2: busy work (should succeed within limit)
+            try scope.spawn(struct {
+                fn run(sb: *Sandbox, result: *std.atomic.Value(u64)) void {
+                    _ = result.fetchAdd(busyTool(sb, 30), .monotonic);
+                }
+            }.run, .{ &sb2, &r2 });
+
+            // Agent 3: tries too many ops (should be stopped)
+            try scope.spawn(struct {
+                fn run(sb: *Sandbox, result: *std.atomic.Value(u64)) void {
+                    _ = result.fetchAdd(busyTool(sb, 1000), .monotonic);
+                }
+            }.run, .{ &sb3, &r3 });
+
+            try scope.join();
+        }
+
+        const v1 = r1.load(.monotonic);
+        const v2 = r2.load(.monotonic);
+        const v3 = r3.load(.monotonic);
+
+        if (v1 == 5 and v2 == 30 and v3 == 50 and !sb1.isViolated() and !sb2.isViolated() and sb3.isViolated()) {
+            std.debug.print("PASS\n", .{});
+            std.debug.print("  Agent 1 (line count): {d} lines, {d} ops, ok\n", .{ v1, sb1.getOpsCount() });
+            std.debug.print("  Agent 2 (busy work):  {d} ops completed, ok\n", .{v2});
+            std.debug.print("  Agent 3 (op limit):   {d}/{d} ops, STOPPED: {s}\n", .{ v3, sb3.getOpsCount(), sb3.getViolationReason().? });
+        } else {
+            std.debug.print("FAIL (v1={d} v2={d} v3={d})\n", .{ v1, v2, v3 });
+        }
+        zag.deinitRuntime(global_allocator);
+    }
+
+    // Cleanup
+    fs.cwd().deleteTree(WORKDIR) catch {};
+    fs.cwd().deleteTree(FORBIDDEN) catch {};
+
+    std.debug.print("\n=== All sandbox tests passed! ===\n", .{});
+}

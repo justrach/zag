@@ -30,6 +30,9 @@ pub const Scope = @import("zag/Scope.zag");
 pub const Scheduler = @import("zag/Scheduler.zag");
 pub const Channel = @import("zag/Channel.zag").Channel;
 pub const Mutex = @import("zag/Mutex.zag");
+pub const EventLoop = @import("zag/EventLoop.zag");
+pub const io = @import("zag/io.zag");
+pub const Sandbox = @import("zag/Sandbox.zag");
 
 /// Check if the current fiber has been cancelled.
 /// Returns error.Cancelled if the cancellation flag is set.
