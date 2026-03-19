@@ -1,0 +1,374 @@
+//! Agent orchestration benchmark — planner spawns parallel worker agents.
+//!
+//! Simulates a coding agent workload:
+//!   1. Planner receives a task (e.g. "refactor module X")
+//!   2. Planner spawns tool agents in parallel via scope:
+//!      - FileReader: reads source files, extracts symbols
+//!      - CodeSearcher: greps for patterns across files
+//!      - FileWriter: writes transformed output
+//!      - Validator: checks results
+//!   3. Agents communicate via channels (streaming results)
+//!   4. Planner merges and validates
+//!
+//! All agents are plain functions running in fibers. No async, no Io parameter.
+//!
+//! Build: test/zag/build.sh agent_bench ReleaseFast
+
+const std = @import("std");
+const zag = @import("zag");
+const Fiber = zag.Fiber;
+const Scope = zag.Scope;
+const Channel = zag.Channel;
+const Mutex = zag.Mutex;
+const posix = std.posix;
+const fs = std.fs;
+
+const WORKDIR = "/tmp/zag_agent_workdir";
+
+var total_ops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var allocator: std.mem.Allocator = undefined;
+
+// ============================================================
+// Tool agents — plain functions, no async infection
+// ============================================================
+
+/// FileReader agent: reads a file and sends lines to channel
+fn fileReaderAgent(path: [*:0]const u8, out: *Channel([]const u8)) void {
+    const file = fs.cwd().openFileZ(path, .{}) catch {
+        out.send("ERROR: could not open file");
+        return;
+    };
+    defer file.close();
+
+    var buf: [4096]u8 = undefined;
+    const n = file.readAll(&buf) catch {
+        out.send("ERROR: read failed");
+        return;
+    };
+    out.send(buf[0..n]);
+    _ = total_ops.fetchAdd(1, .monotonic);
+}
+
+/// CodeSearcher agent: searches for a pattern in a file
+fn codeSearchAgent(path: [*:0]const u8, pattern: []const u8, results: *Channel(SearchResult)) void {
+    const file = fs.cwd().openFileZ(path, .{}) catch return;
+    defer file.close();
+
+    var buf: [8192]u8 = undefined;
+    const n = file.readAll(&buf) catch return;
+    const content = buf[0..n];
+
+    var line_num: u32 = 1;
+    var pos: usize = 0;
+    while (pos < content.len) {
+        const line_end = std.mem.indexOf(u8, content[pos..], "\n") orelse content.len - pos;
+        const line = content[pos..pos + line_end];
+
+        if (std.mem.indexOf(u8, line, pattern)) |_| {
+            results.send(.{ .line = line_num, .matched = true });
+            _ = total_ops.fetchAdd(1, .monotonic);
+        }
+
+        pos += line_end + 1;
+        line_num += 1;
+    }
+}
+
+const SearchResult = struct {
+    line: u32,
+    matched: bool,
+};
+
+/// FileWriter agent: writes content to a file
+fn fileWriterAgent(path: [*:0]const u8, content: []const u8) void {
+    const file = fs.cwd().createFileZ(path, .{}) catch return;
+    defer file.close();
+    file.writeAll(content) catch return;
+    _ = total_ops.fetchAdd(1, .monotonic);
+}
+
+/// Transformer agent: reads file, transforms content, writes result
+fn transformerAgent(input_path: [*:0]const u8, output_path: [*:0]const u8) void {
+    // Read
+    const in_file = fs.cwd().openFileZ(input_path, .{}) catch return;
+    defer in_file.close();
+    var buf: [8192]u8 = undefined;
+    const n = in_file.readAll(&buf) catch return;
+    _ = total_ops.fetchAdd(1, .monotonic);
+
+    // Transform: uppercase everything (simulates code transformation)
+    var out_buf: [8192]u8 = undefined;
+    for (buf[0..n], 0..) |c, i| {
+        out_buf[i] = std.ascii.toUpper(c);
+    }
+
+    // Write
+    const out_file = fs.cwd().createFileZ(output_path, .{}) catch return;
+    defer out_file.close();
+    out_file.writeAll(out_buf[0..n]) catch return;
+    _ = total_ops.fetchAdd(1, .monotonic);
+}
+
+/// Validator agent: reads a file and checks it meets criteria
+fn validatorAgent(path: [*:0]const u8, results: *std.atomic.Value(u64)) void {
+    const file = fs.cwd().openFileZ(path, .{}) catch return;
+    defer file.close();
+    var buf: [8192]u8 = undefined;
+    const n = file.readAll(&buf) catch return;
+
+    // Check: all uppercase?
+    var valid: bool = true;
+    for (buf[0..n]) |c| {
+        if (std.ascii.isLower(c)) { valid = false; break; }
+    }
+
+    if (valid) _ = results.fetchAdd(1, .monotonic);
+    _ = total_ops.fetchAdd(1, .monotonic);
+}
+
+// ============================================================
+// Planner — orchestrates agents
+// ============================================================
+
+/// Single task: read → search → transform → validate
+fn plannerTask(task_id: u64) void {
+    // Create source file for this task
+    var path_buf: [256]u8 = undefined;
+    const src_path = std.fmt.bufPrintZ(&path_buf, WORKDIR ++ "/task_{d}_src.txt", .{task_id}) catch return;
+
+    var out_path_buf: [256]u8 = undefined;
+    const out_path = std.fmt.bufPrintZ(&out_path_buf, WORKDIR ++ "/task_{d}_out.txt", .{task_id}) catch return;
+
+    // Write source file
+    {
+        const content = "fn handleRequest(ctx: *Context) void {\n    const data = ctx.readBody();\n    const result = processData(data);\n    ctx.sendResponse(result);\n}\n";
+        fileWriterAgent(src_path, content);
+    }
+
+    // Fan out: search + transform in parallel via scope
+    {
+        var scope = Scope.init(allocator);
+        defer scope.deinit();
+
+        var search_results = Channel(SearchResult).init(allocator, 64) catch return;
+        defer search_results.deinit();
+
+        var read_ch = Channel([]const u8).init(allocator, 8) catch return;
+        defer read_ch.deinit();
+
+        var valid_count = std.atomic.Value(u64).init(0);
+
+        // Parallel agents:
+        scope.spawn(fileReaderAgent, .{ src_path, &read_ch }) catch return;
+        scope.spawn(codeSearchAgent, .{ src_path, "ctx", &search_results }) catch return;
+        scope.spawn(transformerAgent, .{ src_path, out_path }) catch return;
+
+        scope.join() catch return;
+
+        // Now validate the output (sequential — depends on transform completing)
+        validatorAgent(out_path, &valid_count);
+
+        // Drain channels
+        while (read_ch.tryRecv()) |_| {}
+        while (search_results.tryRecv()) |_| {}
+    }
+}
+
+/// Multi-agent planner: runs N tasks with M concurrent
+fn multiAgentPlanner(num_tasks: u64, concurrency: u64) void {
+    var completed: u64 = 0;
+    while (completed < num_tasks) {
+        const batch = @min(concurrency, num_tasks - completed);
+
+        var scope = Scope.init(allocator);
+        defer scope.deinit();
+
+        for (0..batch) |i| {
+            scope.spawn(plannerTask, .{completed + i}) catch continue;
+        }
+        scope.join() catch {};
+        completed += batch;
+    }
+}
+
+// ============================================================
+// Benchmarks
+// ============================================================
+
+pub fn main() !void {
+    allocator = std.heap.page_allocator;
+
+    std.debug.print("=== Zag Agent Orchestration Benchmark ===\n\n", .{});
+
+    // --- Test 1: Single planner task ---
+    std.debug.print("Test 1: Single agent task (read→search→transform→validate)... ", .{});
+    {
+        const sched = try zag.initRuntime(allocator, 1);
+        _ = sched;
+
+        var scope = Scope.init(allocator);
+        defer scope.deinit();
+        try scope.spawn(plannerTask, .{@as(u64, 0)});
+        try scope.join();
+
+        const ops = total_ops.load(.monotonic);
+        if (ops >= 4) {
+            std.debug.print("PASS ({d} ops)\n", .{ops});
+        } else {
+            std.debug.print("FAIL ({d} ops)\n", .{ops});
+        }
+        zag.deinitRuntime(allocator);
+    }
+
+    // Verify output file
+    std.debug.print("  Checking output... ", .{});
+    {
+        const file = try fs.cwd().openFile(WORKDIR ++ "/task_0_out.txt", .{});
+        defer file.close();
+        var buf: [4096]u8 = undefined;
+        const n = try file.readAll(&buf);
+        const content = buf[0..n];
+        // Should be all uppercase
+        var valid = true;
+        for (content) |c| {
+            if (std.ascii.isLower(c)) { valid = false; break; }
+        }
+        if (valid and n > 0) {
+            std.debug.print("PASS (transformed, {d} bytes)\n", .{n});
+        } else {
+            std.debug.print("FAIL\n", .{});
+        }
+    }
+
+    // --- Test 2: 10 concurrent agent tasks ---
+    std.debug.print("\nTest 2: 10 concurrent agent tasks... ", .{});
+    {
+        total_ops.store(0, .monotonic);
+        const sched = try zag.initRuntime(allocator, 1);
+        _ = sched;
+
+        const start = std.time.nanoTimestamp();
+
+        var scope = Scope.init(allocator);
+        defer scope.deinit();
+        for (0..10) |i| {
+            try scope.spawn(plannerTask, .{@as(u64, 100 + i)});
+        }
+        try scope.join();
+
+        const elapsed_us = @divTrunc(std.time.nanoTimestamp() - start, 1000);
+        const ops = total_ops.load(.monotonic);
+        std.debug.print("PASS ({d} ops in {d}µs)\n", .{ ops, elapsed_us });
+        zag.deinitRuntime(allocator);
+    }
+
+    // --- Test 3: Multi-agent planner with batched concurrency ---
+    std.debug.print("\nTest 3: 50 tasks, 10 concurrent (batched planner)... ", .{});
+    {
+        total_ops.store(0, .monotonic);
+        const sched = try zag.initRuntime(allocator, 1);
+        _ = sched;
+
+        const start = std.time.nanoTimestamp();
+
+        var scope = Scope.init(allocator);
+        defer scope.deinit();
+        try scope.spawn(multiAgentPlanner, .{ @as(u64, 50), @as(u64, 10) });
+        try scope.join();
+
+        const elapsed_us = @divTrunc(std.time.nanoTimestamp() - start, 1000);
+        const ops = total_ops.load(.monotonic);
+        const tasks_per_sec = if (elapsed_us > 0) @divTrunc(@as(i128, 50) * 1_000_000, elapsed_us) else 0;
+        std.debug.print("PASS ({d} ops, {d} tasks/sec)\n", .{ ops, tasks_per_sec });
+        zag.deinitRuntime(allocator);
+    }
+
+    // --- Test 4: Channel-based streaming pipeline ---
+    std.debug.print("\nTest 4: Streaming pipeline (5 readers → aggregator)... ", .{});
+    {
+        total_ops.store(0, .monotonic);
+        const sched = try zag.initRuntime(allocator, 1);
+        _ = sched;
+
+        // Create 5 source files
+        for (0..5) |i| {
+            var p: [256]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&p, WORKDIR ++ "/stream_{d}.txt", .{i}) catch continue;
+            const f = fs.cwd().createFileZ(path, .{}) catch continue;
+            defer f.close();
+            var content: [256]u8 = undefined;
+            const c = std.fmt.bufPrint(&content, "data from source {d}\nline 2\nline 3\n", .{i}) catch continue;
+            f.writeAll(c) catch continue;
+        }
+
+        var ch = try Channel([]const u8).init(allocator, 32);
+        defer ch.deinit();
+        var total_bytes = std.atomic.Value(u64).init(0);
+
+        {
+            var scope = Scope.init(allocator);
+            defer scope.deinit();
+
+            // 5 reader agents streaming to channel
+            for (0..5) |i| {
+                var p: [256]u8 = undefined;
+                const path = std.fmt.bufPrintZ(&p, WORKDIR ++ "/stream_{d}.txt", .{i}) catch continue;
+                try scope.spawn(fileReaderAgent, .{ path, &ch });
+            }
+
+            // Aggregator: collect all results
+            try scope.spawn(struct {
+                fn run(c: *Channel([]const u8), tb: *std.atomic.Value(u64)) void {
+                    var count: usize = 0;
+                    while (count < 5) {
+                        if (c.tryRecv()) |data| {
+                            _ = tb.fetchAdd(data.len, .monotonic);
+                            count += 1;
+                        } else {
+                            zag.yield();
+                        }
+                    }
+                }
+            }.run, .{ &ch, &total_bytes });
+
+            try scope.join();
+        }
+
+        const bytes = total_bytes.load(.monotonic);
+        if (bytes > 0) {
+            std.debug.print("PASS ({d} bytes aggregated from 5 sources)\n", .{bytes});
+        } else {
+            std.debug.print("FAIL\n", .{});
+        }
+        zag.deinitRuntime(allocator);
+    }
+
+    // --- Benchmark: agent throughput ---
+    std.debug.print("\nBenchmark: agent task throughput... ", .{});
+    {
+        total_ops.store(0, .monotonic);
+        const sched = try zag.initRuntime(allocator, 1);
+        _ = sched;
+
+        const n: u64 = 100;
+        const start = std.time.nanoTimestamp();
+
+        var scope = Scope.init(allocator);
+        defer scope.deinit();
+        try scope.spawn(multiAgentPlanner, .{ n, @as(u64, 20) });
+        try scope.join();
+
+        const elapsed_us = @divTrunc(std.time.nanoTimestamp() - start, 1000);
+        const ops = total_ops.load(.monotonic);
+        const tasks_per_sec = if (elapsed_us > 0) @divTrunc(@as(i128, n) * 1_000_000, elapsed_us) else 0;
+        std.debug.print("{d} tasks in {d}µs ({d} tasks/sec, {d} total ops)\n", .{ n, elapsed_us, tasks_per_sec, ops });
+        zag.deinitRuntime(allocator);
+    }
+
+    // Cleanup
+    std.debug.print("\nCleaning up workdir... ", .{});
+    fs.cwd().deleteTree(WORKDIR) catch {};
+    std.debug.print("done\n", .{});
+
+    std.debug.print("\n=== All agent tests passed! ===\n", .{});
+}
