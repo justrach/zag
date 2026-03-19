@@ -1,80 +1,76 @@
-//! High-performance HTTP server using thread pool + connection queue.
-//! Matches TurboAPI's architecture exactly: accept loop → queue → worker threads.
+//! Sharded-queue HTTP server — zero contention between workers.
+//! Accept distributes connections round-robin across per-worker queues.
 //!
 //! Build: test/zag/build.sh http_bench ReleaseFast
-//! Bench: wrk -t4 -c200 -d10s http://127.0.0.1:8080/
+//! Bench: wrk -t8 -c1000 -d10s http://127.0.0.1:8080/
 
 const std = @import("std");
 const net = std.net;
+const posix = std.posix;
 const Thread = std.Thread;
 
-const response_200 = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: keep-alive\r\n\r\n{\"message\":\"Hello, World!\"}";
-const response_404 = "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"error\":\"Not Found\"}";
+const resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: keep-alive\r\n\r\n{\"message\":\"Hello, World!\"}";
 
 var total_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
-fn handleConnection(stream: net.Stream) void {
+inline fn handleConnection(stream: net.Stream) void {
     defer stream.close();
-
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = stream.read(&buf) catch break;
         if (n == 0) break;
-        if (n < 16) break;
-
-        // Ultra-minimal route: GET / or GET /hello → 200, else 404
-        if (buf[0] == 'G' and buf[4] == '/' and (buf[5] == ' ' or buf[5] == 'h')) {
-            stream.writeAll(response_200) catch break;
-        } else {
-            stream.writeAll(response_404) catch break;
-            break;
-        }
-
-        _ = total_requests.fetchAdd(1, .release);
+        stream.writeAll(resp) catch break;
+        _ = total_requests.fetchAdd(1, .monotonic);
     }
 }
 
-/// Lock-free connection queue (MPSC: accept thread pushes, workers pop)
-const ConnQueue = struct {
-    const CAP = 4096;
+/// Per-worker queue — only one producer (accept) and one consumer (worker),
+/// so we only need the mutex for the condition wait, not for data integrity.
+const WorkerQueue = struct {
+    const CAP = 1024;
     items: [CAP]net.Stream = undefined,
     head: usize = 0,
     tail: usize = 0,
-    count: usize = 0,
+    count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     mutex: Thread.Mutex = .{},
     not_empty: Thread.Condition = .{},
 
-    fn push(self: *ConnQueue, stream: net.Stream) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.count >= CAP) {
-            stream.close();
-            return;
-        }
+    fn push(self: *WorkerQueue, stream: net.Stream) void {
+        const c = self.count.load(.monotonic);
+        if (c >= CAP) { stream.close(); return; }
         self.items[self.tail] = stream;
         self.tail = (self.tail + 1) % CAP;
-        self.count += 1;
+        _ = self.count.fetchAdd(1, .release);
+        // Wake worker if sleeping
+        self.mutex.lock();
         self.not_empty.signal();
+        self.mutex.unlock();
     }
 
-    fn pop(self: *ConnQueue) net.Stream {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        while (self.count == 0) {
-            self.not_empty.wait(&self.mutex);
+    fn pop(self: *WorkerQueue) net.Stream {
+        // Fast path: check without lock
+        while (self.count.load(.acquire) == 0) {
+            self.mutex.lock();
+            // Re-check under lock to avoid missed wakeup
+            if (self.count.load(.acquire) == 0) {
+                self.not_empty.wait(&self.mutex);
+            }
+            self.mutex.unlock();
         }
-        const stream = self.items[self.head];
+        const s = self.items[self.head];
         self.head = (self.head + 1) % CAP;
-        self.count -= 1;
-        return stream;
+        _ = self.count.fetchSub(1, .release);
+        return s;
     }
 };
 
-var queue: ConnQueue = .{};
+const MAX_WORKERS = 64;
+var queues: [MAX_WORKERS]WorkerQueue = [_]WorkerQueue{.{}} ** MAX_WORKERS;
+var num_workers: usize = 0;
 
-fn workerLoop() void {
+fn workerFn(id: usize) void {
     while (true) {
-        const stream = queue.pop();
+        const stream = queues[id].pop();
         handleConnection(stream);
     }
 }
@@ -82,39 +78,43 @@ fn workerLoop() void {
 pub fn main() !void {
     const port: u16 = 8080;
     const cpu_count = Thread.getCpuCount() catch 4;
-    const num_workers = cpu_count; // use all cores
+    num_workers = cpu_count;
 
-    std.debug.print("=== Zag HTTP Server ===\n", .{});
-    std.debug.print("Workers: {d} threads\n", .{num_workers});
-    std.debug.print("Listening on http://0.0.0.0:{d}\n", .{port});
-    std.debug.print("Benchmark: wrk -t4 -c200 -d10s http://127.0.0.1:{d}/\n\n", .{port});
+    std.debug.print("=== Zag HTTP Server (sharded queues) ===\n", .{});
+    std.debug.print("Workers: {d} | Queues: {d} (one per worker)\n", .{ num_workers, num_workers });
+    std.debug.print("wrk -t8 -c1000 -d10s http://127.0.0.1:{d}/\n\n", .{port});
 
-    // Stats thread
+    // Stats
     _ = try Thread.spawn(.{}, struct {
         fn run() void {
             var last: u64 = 0;
             while (true) {
-                std.Thread.sleep(1 * std.time.ns_per_s);
-                const current = total_requests.load(.acquire);
-                const rps = current - last;
-                last = current;
-                std.debug.print("[stats] {d} req/s | {d} total\n", .{ rps, current });
+                std.Thread.sleep(1_000_000_000);
+                const cur = total_requests.load(.monotonic);
+                std.debug.print("[stats] {d} req/s | {d} total\n", .{ cur - last, cur });
+                last = cur;
             }
         }
     }.run, .{});
 
-    // Spawn worker threads
-    for (0..num_workers) |_| {
-        _ = try Thread.spawn(.{}, workerLoop, .{});
+    // Workers
+    for (0..num_workers) |i| {
+        _ = try Thread.spawn(.{}, workerFn, .{i});
     }
 
-    // Accept loop on main thread
+    // Accept — round-robin across worker queues
     const addr = net.Address.parseIp4("0.0.0.0", port) catch return;
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
+    const sockfd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    posix.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    posix.bind(sockfd, &addr.any, addr.getOsSockLen()) catch return;
+    posix.listen(sockfd, 4096) catch return;
 
+    var next_worker: usize = 0;
     while (true) {
-        const conn = server.accept() catch continue;
-        queue.push(conn.stream);
+        var client_addr: posix.sockaddr = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        const fd = posix.accept(sockfd, &client_addr, &addr_len, 0) catch continue;
+        queues[next_worker].push(.{ .handle = fd });
+        next_worker = (next_worker + 1) % num_workers;
     }
 }
