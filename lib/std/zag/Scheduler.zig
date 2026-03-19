@@ -57,7 +57,6 @@ pub const Worker = struct {
 
     /// Execute a single fiber until it yields or completes.
     pub fn runFiber(self: *Worker, fiber: *Fiber) void {
-        _ = self;
         fiber.state = .running;
         Fiber.switchFromScheduler(fiber);
 
@@ -76,7 +75,8 @@ pub const Worker = struct {
                 }
             },
             .suspended => {
-                // Fiber yielded — it'll be re-enqueued by whoever unparks it
+                // Fiber yielded — re-enqueue it so it can resume
+                self.local_queue.push(fiber);
             },
             else => {},
         }
@@ -120,13 +120,12 @@ pub const Worker = struct {
 /// Simple lock-free fiber queue (MPSC for global, LIFO for local).
 /// This is a basic implementation — can be upgraded to Chase-Lev deque later.
 pub const FiberQueue = struct {
+    const capacity = 16384;
+
     head: std.atomic.Value(?*Fiber) = std.atomic.Value(?*Fiber).init(null),
     tail: std.atomic.Value(?*Fiber) = std.atomic.Value(?*Fiber).init(null),
     len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
-    // Intrusive linked list node stored in padding after Fiber
-    // For simplicity, we use a separate array-backed queue
-    items: [4096]?*Fiber = [_]?*Fiber{null} ** 4096,
+    items: [capacity]?*Fiber = [_]?*Fiber{null} ** capacity,
     write_pos: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     read_pos: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
@@ -135,7 +134,7 @@ pub const FiberQueue = struct {
     }
 
     pub fn push(self: *FiberQueue, fiber: *Fiber) void {
-        const pos = self.write_pos.load(.acquire) % 4096;
+        const pos = self.write_pos.load(.acquire) % capacity;
         self.items[pos] = fiber;
         _ = self.write_pos.fetchAdd(1, .release);
         _ = self.len.fetchAdd(1, .release);
@@ -145,7 +144,7 @@ pub const FiberQueue = struct {
         const len = self.len.load(.acquire);
         if (len == 0) return null;
 
-        const pos = self.read_pos.load(.acquire) % 4096;
+        const pos = self.read_pos.load(.acquire) % capacity;
         const fiber = self.items[pos] orelse return null;
         self.items[pos] = null;
         _ = self.read_pos.fetchAdd(1, .release);

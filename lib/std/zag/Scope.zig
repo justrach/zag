@@ -88,15 +88,26 @@ pub fn fiberCompleted(self: *Scope, fiber: *Fiber) void {
 pub fn join(self: *Scope) !void {
     self.joined = true;
 
-    // Participate in work while waiting for our fibers to complete
     const sched = Scheduler.getGlobal() orelse return;
     const workers = sched.workers orelse return;
 
-    // Ensure scheduler context is set up on this thread
-    Fiber.setSchedulerContext(&workers[0].sched_context);
+    // If we're inside a fiber (nested scope), use a local context
+    // so we don't clobber the outer scheduler context.
+    // If we're on the main thread (no current fiber), set up the worker context.
+    var local_ctx: Fiber.Context = .{};
+    const prev_ctx = Fiber.getSchedulerContext();
+    if (prev_ctx == null) {
+        Fiber.setSchedulerContext(&workers[0].sched_context);
+    } else {
+        Fiber.setSchedulerContext(&local_ctx);
+    }
+    defer {
+        if (prev_ctx) |ctx| {
+            Fiber.setSchedulerContext(ctx);
+        }
+    }
 
     while (self.pending.load(.acquire) > 0) {
-        // Help run fibers (not just ours — any fiber, to avoid deadlocks)
         if (workers[0].getNextFiber()) |fiber| {
             workers[0].runFiber(fiber);
         } else {
