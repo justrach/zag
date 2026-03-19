@@ -1,0 +1,119 @@
+//! Channel(T) — bounded typed channel with fiber backpressure.
+//!
+//! When a fiber sends to a full channel, it parks (yields) until space is available.
+//! When a fiber receives from an empty channel, it parks until data arrives.
+//! Closing a channel causes all pending receives to return null.
+//!
+//! Usage:
+//!   var ch = zag.Channel(u64).init(allocator, 16);
+//!   defer ch.deinit();
+//!   ch.send(42);           // parks fiber if full
+//!   const val = ch.recv(); // parks fiber if empty, null if closed
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Fiber = @import("Fiber.zig");
+
+/// Bounded channel with fiber-aware backpressure.
+pub fn Channel(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        buffer: []T,
+        allocator: Allocator,
+        capacity: usize,
+
+        // Ring buffer state
+        head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0), // next read
+        tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0), // next write
+        count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+        closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        pub fn init(allocator: Allocator, cap: usize) !Self {
+            const buffer = try allocator.alloc(T, cap);
+            return Self{
+                .buffer = buffer,
+                .allocator = allocator,
+                .capacity = cap,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.allocator.free(self.buffer);
+            self.* = undefined;
+        }
+
+        /// Send a value. Parks the fiber if channel is full.
+        pub fn send(self: *Self, value: T) void {
+            // Spin-yield until there's space
+            while (self.count.load(.acquire) >= self.capacity) {
+                if (self.closed.load(.acquire)) return;
+                // Yield to let consumers run
+                const zag = @import("../zag.zig");
+                zag.yield();
+            }
+
+            const pos = self.tail.load(.acquire) % self.capacity;
+            self.buffer[pos] = value;
+            _ = self.tail.fetchAdd(1, .release);
+            _ = self.count.fetchAdd(1, .release);
+        }
+
+        /// Try to send without blocking. Returns false if full.
+        pub fn trySend(self: *Self, value: T) bool {
+            if (self.count.load(.acquire) >= self.capacity) return false;
+            if (self.closed.load(.acquire)) return false;
+
+            const pos = self.tail.load(.acquire) % self.capacity;
+            self.buffer[pos] = value;
+            _ = self.tail.fetchAdd(1, .release);
+            _ = self.count.fetchAdd(1, .release);
+            return true;
+        }
+
+        /// Receive a value. Parks the fiber if channel is empty.
+        /// Returns null if channel is closed and empty.
+        pub fn recv(self: *Self) ?T {
+            while (self.count.load(.acquire) == 0) {
+                if (self.closed.load(.acquire)) return null;
+                // Yield to let producers run
+                const zag = @import("../zag.zig");
+                zag.yield();
+            }
+
+            const pos = self.head.load(.acquire) % self.capacity;
+            const value = self.buffer[pos];
+            _ = self.head.fetchAdd(1, .release);
+            _ = self.count.fetchSub(1, .release);
+            return value;
+        }
+
+        /// Try to receive without blocking. Returns null if empty.
+        pub fn tryRecv(self: *Self) ?T {
+            if (self.count.load(.acquire) == 0) return null;
+
+            const pos = self.head.load(.acquire) % self.capacity;
+            const value = self.buffer[pos];
+            _ = self.head.fetchAdd(1, .release);
+            _ = self.count.fetchSub(1, .release);
+            return value;
+        }
+
+        /// Close the channel. No more sends allowed.
+        /// Pending receivers will get null.
+        pub fn close(self: *Self) void {
+            self.closed.store(true, .release);
+        }
+
+        /// Returns current number of items in the channel.
+        pub fn len(self: *const Self) usize {
+            return self.count.load(.acquire);
+        }
+
+        /// Returns true if the channel has been closed.
+        pub fn isClosed(self: *const Self) bool {
+            return self.closed.load(.acquire);
+        }
+    };
+}

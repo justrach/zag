@@ -16,13 +16,20 @@
 //!   try scope.join();
 //!
 //!   // Cooperative cancellation
-//!   zag.checkCancel();
+//!   try zag.checkCancel();
+//!
+//!   // Channels
+//!   var ch = try zag.Channel(u64).init(allocator, 16);
+//!   ch.send(42);
+//!   const val = ch.recv();
 
 const std = @import("std");
 
 pub const Fiber = @import("zag/Fiber.zig");
 pub const Scope = @import("zag/Scope.zig");
 pub const Scheduler = @import("zag/Scheduler.zig");
+pub const Channel = @import("zag/Channel.zig").Channel;
+pub const Mutex = @import("zag/Mutex.zig");
 
 /// Check if the current fiber has been cancelled.
 /// Returns error.Cancelled if the cancellation flag is set.
@@ -52,22 +59,115 @@ pub fn spawn(allocator: std.mem.Allocator, comptime func: anytype, args: anytype
     return sched.spawn(allocator, func, args);
 }
 
+/// Run a function with a timeout. If the deadline expires before the function
+/// completes, the fiber is cancelled and error.Cancelled is returned.
+///
+/// Usage:
+///   zag.withTimeout(30 * std.time.ns_per_s, handleRequest, .{stream}) catch |err| {
+///       if (err == error.Cancelled) sendTimeout(stream);
+///   };
+pub fn withTimeout(timeout_ns: u64, allocator: std.mem.Allocator, comptime func: anytype, args: anytype) !void {
+    const sched = Scheduler.getGlobal() orelse return error.NoScheduler;
+
+    // Spawn the work fiber
+    const work_fiber = try sched.spawn(allocator, func, args);
+
+    // Spawn a timer fiber that cancels the work fiber after timeout
+    const TimerArgs = struct { target: *Fiber, ns: u64 };
+    const timer_fn = struct {
+        fn run(targs: *const TimerArgs) void {
+            // Busy-yield until timeout expires
+            const deadline = std.time.nanoTimestamp() + @as(i128, targs.ns);
+            while (std.time.nanoTimestamp() < deadline) {
+                const zag_mod = @import("zag/Fiber.zig");
+                if (zag_mod.getCurrentFiber()) |f| {
+                    if (f.isCancelled()) return; // work completed, timer cancelled
+                }
+                const outer = @import("zag.zig");
+                outer.yield();
+            }
+            // Timeout — cancel the work fiber
+            targs.target.cancel();
+        }
+    }.run;
+
+    const timer_args = TimerArgs{ .target = work_fiber, .ns = timeout_ns };
+    const timer_fiber = try sched.spawn(allocator, timer_fn, .{&timer_args});
+
+    // Wait for work fiber to complete
+    // Use a scope to ensure both fibers are tracked
+    while (work_fiber.state != .completed and work_fiber.state != .cancelled) {
+        const workers = sched.workers orelse return;
+        if (Fiber.getSchedulerContext() == null) {
+            Fiber.setSchedulerContext(&workers[0].sched_context);
+        }
+        if (workers[0].getNextFiber()) |fiber| {
+            workers[0].runFiber(fiber);
+        } else {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    // Cancel the timer if work completed
+    timer_fiber.cancel();
+    // Drain the timer fiber
+    while (timer_fiber.state != .completed and timer_fiber.state != .cancelled) {
+        const workers = sched.workers orelse return;
+        if (workers[0].getNextFiber()) |fiber| {
+            workers[0].runFiber(fiber);
+        } else {
+            break; // timer might still be queued, just leave it
+        }
+    }
+
+    if (work_fiber.@"error") |err| return err;
+    if (work_fiber.state == .cancelled) return error.Cancelled;
+}
+
 /// Sleep the current fiber for the given number of nanoseconds.
 /// Parks the fiber — does not block the OS thread.
 pub fn sleep(ns: u64) void {
-    // TODO: integrate with event loop timer
-    // For now, yield and busy-wait (placeholder)
-    _ = ns;
-    yield();
+    const deadline = std.time.nanoTimestamp() + @as(i128, ns);
+    while (std.time.nanoTimestamp() < deadline) {
+        yield();
+    }
 }
 
-/// Run a blocking function on a dedicated thread pool,
+/// Run a blocking function on a dedicated OS thread,
 /// preventing it from starving other fibers on this core.
-/// Placeholder — will be implemented with dedicated blocking pool.
-pub fn blockingCall(comptime func: anytype, args: anytype) @typeInfo(@TypeOf(func)).@"fn".return_type.? {
-    // TODO: move fiber to blocking pool
-    // For now, just call directly
-    return @call(.auto, func, args);
+///
+/// The current fiber is parked while the blocking call executes on a
+/// separate thread. When the call completes, the fiber is re-enqueued.
+pub fn blockingCall(allocator: std.mem.Allocator, comptime func: anytype, args: anytype) @typeInfo(@TypeOf(func)).@"fn".return_type.? {
+    const Args = @TypeOf(args);
+    const ReturnType = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
+
+    const Ctx = struct {
+        args: Args,
+        result: ReturnType = undefined,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    };
+
+    var ctx = Ctx{ .args = args };
+
+    // Spawn an OS thread to do the blocking work
+    const thread = std.Thread.spawn(.{ .allocator = allocator }, struct {
+        fn run(c: *Ctx) void {
+            c.result = @call(.auto, func, c.args);
+            c.done.store(true, .release);
+        }
+    }.run, .{&ctx}) catch {
+        // Fallback: run inline if thread spawn fails
+        return @call(.auto, func, args);
+    };
+
+    // Yield while waiting for the blocking call to finish
+    while (!ctx.done.load(.acquire)) {
+        yield();
+    }
+
+    thread.join();
+    return ctx.result;
 }
 
 /// Initialize the global scheduler and start worker threads.
@@ -93,4 +193,6 @@ test {
     _ = Fiber;
     _ = Scope;
     _ = Scheduler;
+    _ = Channel;
+    _ = Mutex;
 }
