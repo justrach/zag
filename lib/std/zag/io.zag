@@ -1,0 +1,87 @@
+//! Fiber-aware I/O — read/write that suspend the fiber instead of blocking.
+//!
+//! These functions set the fd to non-blocking, register with the thread's
+//! kqueue event loop, suspend the fiber, and resume when the fd is ready.
+//! The caller's code looks identical to blocking I/O — zero infection.
+//!
+//! Usage (inside a fiber):
+//!   const n = try zag.io.read(fd, &buf);
+//!   try zag.io.writeAll(fd, response);
+
+const std = @import("std");
+const posix = std.posix;
+const EventLoop = @import("EventLoop.zag");
+
+pub const Error = error{
+    ConnectionClosed,
+    ReadError,
+    WriteError,
+    WouldBlock,
+    NoEventLoop,
+};
+
+/// Set a file descriptor to non-blocking mode.
+pub fn setNonBlocking(fd: posix.fd_t) void {
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
+    _ = posix.fcntl(fd, posix.F.SETFL, flags | @as(usize, 0x0004)) catch return;
+}
+
+/// Fiber-aware read. Suspends the fiber if the fd would block,
+/// resumes when data is available.
+pub fn read(fd: posix.fd_t, buf: []u8) !usize {
+    while (true) {
+        const result = posix.read(fd, buf);
+        if (result) |n| {
+            if (n == 0) return error.ConnectionClosed;
+            return n;
+        } else |err| {
+            if (err == error.WouldBlock) {
+                // Register with event loop and suspend fiber
+                const el = EventLoop.getCurrent() orelse return error.NoEventLoop;
+                el.waitReadable(fd);
+                // Fiber resumes here when fd is ready — retry read
+                continue;
+            }
+            return error.ReadError;
+        }
+    }
+}
+
+/// Fiber-aware write. Suspends the fiber if the fd would block,
+/// resumes when the fd is writable. Writes all bytes.
+pub fn writeAll(fd: posix.fd_t, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        const result = posix.write(fd, data[written..]);
+        if (result) |n| {
+            if (n == 0) return error.WriteError;
+            written += n;
+        } else |err| {
+            if (err == error.WouldBlock) {
+                const el = EventLoop.getCurrent() orelse return error.NoEventLoop;
+                el.waitWritable(fd);
+                continue;
+            }
+            return error.WriteError;
+        }
+    }
+}
+
+/// Fiber-aware accept. Suspends the fiber if no connections pending.
+pub fn accept(sockfd: posix.fd_t) !posix.fd_t {
+    while (true) {
+        var client_addr: posix.sockaddr = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        const result = posix.accept(sockfd, &client_addr, &addr_len, 0);
+        if (result) |fd| {
+            return fd;
+        } else |err| {
+            if (err == error.WouldBlock) {
+                const el = EventLoop.getCurrent() orelse return error.NoEventLoop;
+                el.waitReadable(sockfd); // accept readiness = read event on listen socket
+                continue;
+            }
+            return error.ReadError;
+        }
+    }
+}

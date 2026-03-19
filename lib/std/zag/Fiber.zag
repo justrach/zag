@@ -20,8 +20,10 @@ pub const State = enum {
     dormant,
     /// Currently executing on a worker thread
     running,
-    /// Suspended, waiting to be resumed (yielded or parked)
+    /// Suspended via yield — will be re-enqueued immediately
     suspended,
+    /// Parked on I/O — waiting for kqueue event, do NOT re-enqueue
+    parked_io,
     /// Finished execution
     completed,
     /// Cancelled via checkCancel()

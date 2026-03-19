@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const Fiber = @import("Fiber.zag");
+const EventLoop = @import("EventLoop.zag");
 const Thread = std.Thread;
 
 const Scheduler = @This();
@@ -25,27 +26,52 @@ pub const Worker = struct {
     scheduler: *Scheduler,
     /// Scheduler context saved when switching to a fiber
     sched_context: Fiber.Context = .{},
+    /// Per-worker kqueue event loop for fiber-aware I/O
+    event_loop: ?EventLoop = null,
 
     pub fn init(id: usize, scheduler: *Scheduler) Worker {
         return .{
             .local_queue = FiberQueue.init(),
             .id = id,
             .scheduler = scheduler,
+            .event_loop = EventLoop.init() catch null,
         };
     }
 
-    /// Main worker loop: run fibers from local queue, steal if empty.
+    /// Main worker loop: run fibers, poll I/O between runs.
     pub fn run(self: *Worker) void {
-        // Set up thread-local scheduler context
+        // Set up thread-local scheduler context and event loop
         Fiber.setSchedulerContext(&self.sched_context);
+        if (self.event_loop) |*el| EventLoop.setCurrent(el);
+
+        var ready_buf: [256]?*Fiber = undefined;
 
         while (!self.scheduler.shutdown_flag.load(.acquire)) {
+            // 1. Poll kqueue for I/O-ready fibers (non-blocking)
+            if (self.event_loop) |*el| {
+                const n = el.poll(&ready_buf);
+                for (ready_buf[0..n]) |maybe_fiber| {
+                    if (maybe_fiber) |fiber| {
+                        self.scheduler.global_queue.push(fiber);
+                    }
+                }
+            }
+
+            // 2. Run next fiber
             if (self.getNextFiber()) |fiber| {
                 self.runFiber(fiber);
             } else {
-                // No work — brief pause before retrying
-                // In production this would use futex/condition variable
-                std.Thread.yield() catch {};
+                // No runnable fibers — poll with timeout to wait for I/O
+                if (self.event_loop) |*el| {
+                    const n = el.pollWait(&ready_buf, 1); // 1ms
+                    for (ready_buf[0..n]) |maybe_fiber| {
+                        if (maybe_fiber) |fiber| {
+                            self.scheduler.global_queue.push(fiber);
+                        }
+                    }
+                } else {
+                    std.Thread.yield() catch {};
+                }
             }
         }
 
@@ -76,8 +102,11 @@ pub const Worker = struct {
             },
             .suspended => {
                 // Fiber yielded — push to global queue for fair scheduling
-                // (local queue is LIFO which starves other fibers)
                 self.scheduler.global_queue.push(fiber);
+            },
+            .parked_io => {
+                // Fiber waiting on kqueue — do NOT re-enqueue.
+                // EventLoop.poll() will re-enqueue when I/O is ready.
             },
             else => {},
         }
