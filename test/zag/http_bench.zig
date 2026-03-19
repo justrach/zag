@@ -1,19 +1,18 @@
-//! Fiber HTTP server benchmark — mimics TurboAPI's architecture.
+//! Multi-threaded fiber HTTP server benchmark.
 //!
-//! TurboAPI: accept loop → mutex queue → 24 OS threads → handleOneRequest (blocking I/O)
-//! Zag fiber: accept loop → spawn fiber per connection → scheduler runs fibers on 1 thread
+//! Architecture:
+//!   Main thread: accept loop → spawn fiber per connection → push to global queue
+//!   Worker threads: pop fibers from global queue, run them (blocking I/O for now)
 //!
-//! This demonstrates the fiber advantage: thousands of concurrent connections
-//! on a single OS thread, vs TurboAPI's 24.
-//!
-//! Run with: zig build-exe --dep zag -Mroot=test/zag/http_bench.zig -Mzag=lib/std/zag.zig -O ReleaseFast
-//! Then: wrk -t4 -c100 -d10s http://127.0.0.1:8080/
+//! Run: zig build-exe --dep zag -Mroot=test/zag/http_bench.zig -Mzag=lib/std/zag.zig -O ReleaseFast
+//! Bench: wrk -t4 -c200 -d10s http://127.0.0.1:8080/
 
 const std = @import("std");
 const zag = @import("zag");
 const net = std.net;
 const Fiber = zag.Fiber;
-const Scope = zag.Scope;
+const Scheduler = zag.Scheduler;
+const Thread = std.Thread;
 
 const response_200 = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: keep-alive\r\n\r\n{\"message\":\"Hello, World!\"}";
 const response_404 = "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"error\":\"Not Found\"}";
@@ -26,14 +25,11 @@ fn handleConnection(stream: net.Stream) void {
     defer _ = active_connections.fetchSub(1, .release);
     _ = active_connections.fetchAdd(1, .release);
 
-    // Keep-alive loop: handle multiple requests per connection
     var buf: [4096]u8 = undefined;
     while (true) {
-        // Read request
         const n = stream.read(&buf) catch break;
         if (n == 0) break;
 
-        // Minimal HTTP parse — find end of headers
         const request = buf[0..n];
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse {
             stream.writeAll(response_404) catch break;
@@ -41,21 +37,18 @@ fn handleConnection(stream: net.Stream) void {
         };
         _ = header_end;
 
-        // Parse method + path from first line
         const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse break;
         const first_line = request[0..first_line_end];
 
         var parts = std.mem.splitScalar(u8, first_line, ' ');
-        const method = parts.next() orelse break;
+        _ = parts.next() orelse break; // method
         const path = parts.next() orelse break;
-        _ = method;
 
-        // Route
         if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/hello")) {
             stream.writeAll(response_200) catch break;
         } else {
             stream.writeAll(response_404) catch break;
-            break; // close on 404
+            break;
         }
 
         _ = total_requests.fetchAdd(1, .release);
@@ -66,26 +59,46 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
     const port: u16 = 8080;
 
-    // Initialize fiber runtime
-    const sched = try zag.initRuntime(allocator, 1);
+    // Detect CPU count
+    const cpu_count = Thread.getCpuCount() catch 4;
+    const num_workers = @max(cpu_count, 2);
 
+    std.debug.print("=== Zag Fiber HTTP Server (multi-threaded) ===\n", .{});
+    std.debug.print("Workers: {d} threads\n", .{num_workers});
+    std.debug.print("Fiber stacks: 16KB\n", .{});
+
+    // Initialize scheduler with N worker threads
+    const sched = try allocator.create(Scheduler);
+    sched.* = try Scheduler.init(allocator, num_workers);
+
+    // Allocate workers
+    sched.workers = try allocator.alloc(Scheduler.Worker, num_workers);
+    for (sched.workers.?, 0..) |*worker, i| {
+        worker.* = Scheduler.Worker.init(i, sched);
+    }
+    Scheduler.setGlobal(sched);
+
+    // Start worker threads (all of them — main thread does accept only)
+    for (sched.workers.?) |*worker| {
+        worker.thread = try Thread.spawn(.{}, Scheduler.Worker.run, .{worker});
+    }
+
+    // Bind and listen
     const addr = net.Address.parseIp4("0.0.0.0", port) catch return;
     var server = try addr.listen(.{
         .reuse_address = true,
     });
     defer server.deinit();
 
-    std.debug.print("=== Zag Fiber HTTP Server ===\n", .{});
     std.debug.print("Listening on http://0.0.0.0:{d}\n", .{port});
-    std.debug.print("Fiber runtime: single-threaded, 16KB stacks\n", .{});
-    std.debug.print("Benchmark with: wrk -t4 -c100 -d10s http://127.0.0.1:{d}/\n\n", .{port});
+    std.debug.print("Benchmark: wrk -t4 -c200 -d10s http://127.0.0.1:{d}/\n\n", .{port});
 
-    // Stats printer fiber
-    _ = try zag.spawn(allocator, struct {
+    // Stats thread
+    const stats_thread = try Thread.spawn(.{}, struct {
         fn run() void {
             var last: u64 = 0;
             while (true) {
-                zag.sleep(1 * std.time.ns_per_s);
+                std.Thread.sleep(1 * std.time.ns_per_s);
                 const current = total_requests.load(.acquire);
                 const rps = current - last;
                 last = current;
@@ -94,26 +107,25 @@ pub fn main() !void {
             }
         }
     }.run, .{});
+    _ = stats_thread;
 
-    // Accept loop — each connection becomes a fiber
-    Fiber.setSchedulerContext(&sched.workers.?[0].sched_context);
-
+    // Accept loop — main thread only does accept + spawn
     while (true) {
         const conn = server.accept() catch continue;
 
-        // Spawn a fiber for this connection
-        _ = zag.spawn(allocator, handleConnection, .{conn.stream}) catch {
+        // Create fiber for this connection
+        const fiber = allocator.create(Fiber) catch {
             conn.stream.close();
             continue;
         };
+        fiber.* = Fiber.init(allocator, Fiber.default_stack_size) catch {
+            allocator.destroy(fiber);
+            conn.stream.close();
+            continue;
+        };
+        fiber.setup(handleConnection, .{conn.stream});
 
-        // Run some fibers between accepts to keep things moving
-        const workers = sched.workers orelse continue;
-        var ran: usize = 0;
-        while (ran < 16) : (ran += 1) {
-            if (workers[0].getNextFiber()) |fiber| {
-                workers[0].runFiber(fiber);
-            } else break;
-        }
+        // Submit to scheduler — worker threads will pick it up
+        sched.submit(fiber);
     }
 }
