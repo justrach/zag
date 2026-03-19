@@ -92,6 +92,9 @@ pub fn join(self: *Scope) !void {
     const sched = Scheduler.getGlobal() orelse return;
     const workers = sched.workers orelse return;
 
+    // Ensure scheduler context is set up on this thread
+    Fiber.setSchedulerContext(&workers[0].sched_context);
+
     while (self.pending.load(.acquire) > 0) {
         // Help run fibers (not just ours — any fiber, to avoid deadlocks)
         if (workers[0].getNextFiber()) |fiber| {

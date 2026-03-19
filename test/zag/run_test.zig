@@ -41,20 +41,12 @@ pub fn main() !void {
         }
     }
 
-    // Test 3: Raw context switch
+    // Test 3: Raw context switch round-trip
     std.debug.print("Test 3: Raw context switch... ", .{});
     {
         var sched_ctx: Fiber.Context = .{};
-        _ = Fiber.Context{};
-        const flag: u64 = 0;
-        _ = flag;
-
-        // We'll use inline asm to test: save current context to sched_ctx,
-        // then immediately restore it (round-trip test)
         Fiber.setSchedulerContext(&sched_ctx);
         Fiber.switchContext(&sched_ctx, &sched_ctx);
-        // If we get here, the round-trip context switch worked
-        _ = flag;
         std.debug.print("PASS\n", .{});
     }
 
@@ -64,6 +56,71 @@ pub fn main() !void {
         const sched = try zag.initRuntime(allocator, 1);
         _ = sched;
         std.debug.print("PASS\n", .{});
+        zag.deinitRuntime(allocator);
+    }
+
+    // Test 5: Spawn and run a single fiber
+    std.debug.print("Test 5: Spawn + run fiber... ", .{});
+    {
+        const sched = try zag.initRuntime(allocator, 1);
+
+        var counter = std.atomic.Value(u64).init(0);
+        _ = try zag.spawn(allocator, simpleAdd, .{ &counter, 42 });
+
+        sched.runUntilComplete();
+
+        if (counter.load(.acquire) == 42) {
+            std.debug.print("PASS\n", .{});
+        } else {
+            std.debug.print("FAIL (got {})\n", .{counter.load(.acquire)});
+            return error.TestFailed;
+        }
+        zag.deinitRuntime(allocator);
+    }
+
+    // Test 6: Spawn 10 fibers
+    std.debug.print("Test 6: Spawn 10 fibers... ", .{});
+    {
+        const sched = try zag.initRuntime(allocator, 1);
+
+        var counter = std.atomic.Value(u64).init(0);
+        for (0..10) |_| {
+            _ = try zag.spawn(allocator, simpleAdd, .{ &counter, 1 });
+        }
+
+        sched.runUntilComplete();
+
+        if (counter.load(.acquire) == 10) {
+            std.debug.print("PASS\n", .{});
+        } else {
+            std.debug.print("FAIL (got {})\n", .{counter.load(.acquire)});
+            return error.TestFailed;
+        }
+        zag.deinitRuntime(allocator);
+    }
+
+    // Test 7: Agent pattern — scope with parallel tool fan-out
+    std.debug.print("Test 7: Agent fan-out (scope)... ", .{});
+    {
+        const sched = try zag.initRuntime(allocator, 1);
+        _ = sched;
+
+        var result = std.atomic.Value(u64).init(0);
+        {
+            var scope = Scope.init(allocator);
+            defer scope.deinit();
+            try scope.spawn(simulateToolCall, .{ &result, 1 }); // search
+            try scope.spawn(simulateToolCall, .{ &result, 2 }); // database
+            try scope.spawn(simulateToolCall, .{ &result, 4 }); // cache
+            try scope.join();
+        }
+
+        if (result.load(.acquire) == 7) {
+            std.debug.print("PASS\n", .{});
+        } else {
+            std.debug.print("FAIL (got {})\n", .{result.load(.acquire)});
+            return error.TestFailed;
+        }
         zag.deinitRuntime(allocator);
     }
 

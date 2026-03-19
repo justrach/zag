@@ -68,6 +68,11 @@ pub const Worker = struct {
                 if (fiber.scope) |scope_ptr| {
                     const scope: *@import("Scope.zig") = @ptrCast(@alignCast(scope_ptr));
                     scope.fiberCompleted(fiber);
+                } else {
+                    // No scope — decrement active count directly
+                    if (Scheduler.getGlobal()) |sched| {
+                        _ = sched.active_fibers.fetchSub(1, .release);
+                    }
                 }
             },
             .suspended => {

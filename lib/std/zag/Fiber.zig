@@ -183,15 +183,20 @@ fn initContext(self: *Fiber, stack_top: usize) void {
     self.context = .{};
     switch (builtin.cpu.arch) {
         .aarch64 => {
+            // On aarch64, ret jumps to x30. We point x30 at our trampoline.
+            // We pass the fiber pointer in x19 (callee-saved, survives the switch).
             self.context.sp = stack_top;
-            self.context.x30 = @intFromPtr(&fiberStart);
+            self.context.x30 = @intFromPtr(&fiberTrampoline);
+            self.context.x19 = @intFromPtr(self);
         },
         .x86_64 => {
-            // x86_64: return address is at top of stack
+            // On x86_64, ret pops the return address from the stack.
+            // We pass the fiber pointer in r12 (callee-saved).
             const rsp = stack_top - @sizeOf(u64);
             const ret_addr_ptr: *u64 = @ptrFromInt(rsp);
-            ret_addr_ptr.* = @intFromPtr(&fiberStart);
+            ret_addr_ptr.* = @intFromPtr(&fiberTrampoline);
             self.context.rsp = rsp;
+            self.context.r12 = @intFromPtr(self);
         },
         else => unreachable,
     }
@@ -199,13 +204,29 @@ fn initContext(self: *Fiber, stack_top: usize) void {
 
 /// Entry point for a newly started fiber.
 /// Called via the context switch with the fiber pointer in a known register.
-fn fiberStart() callconv(.c) void {
-    // The current fiber pointer is stored in thread-local state by the scheduler
-    const fiber = getCurrentFiber() orelse unreachable;
+/// Trampoline: entered via `ret` after the first context switch to a new fiber.
+/// The fiber pointer is in x19 (aarch64) or r12 (x86_64), placed there by initContext.
+/// This is a regular function — the context switch `ret` acts like a call to it.
+fn fiberTrampoline() callconv(.c) noreturn {
+    const fiber: *Fiber = switch (builtin.cpu.arch) {
+        .aarch64 => @ptrFromInt(asm volatile (""
+            : [ret] "={x19}" (-> usize),
+        )),
+        .x86_64 => @ptrFromInt(asm volatile (""
+            : [ret] "={r12}" (-> usize),
+        )),
+        else => unreachable,
+    };
+
+    // Also set TLS so checkCancel/yield can find us
+    setCurrentFiber(fiber);
     fiber.state = .running;
+
+    // Call the actual entry function
     fiber.entry_fn(fiber);
-    // entry_fn sets state to .completed and yields back
-    // If we somehow get here, just loop (shouldn't happen)
+
+    // entry_fn sets state to .completed and calls switchToScheduler.
+    // We should never reach here.
     unreachable;
 }
 
