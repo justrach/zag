@@ -1,9 +1,4 @@
-//! gnet-style reactor HTTP server — kqueue event loops, non-blocking I/O.
-//!
-//! Architecture (gnet pattern):
-//!   Main reactor: kqueue accept loop, distributes connections round-robin
-//!   Sub-reactors: per-core kqueue event loops, handle read/write for assigned fds
-//!   Zero cross-thread contention — each reactor owns its connections
+//! Pure blocking thread pool — maximizing req/s.
 //!
 //! Build: test/zag/build.sh http_bench ReleaseFast
 //! Bench: wrk -t8 -c1000 -d10s http://127.0.0.1:8080/
@@ -12,153 +7,66 @@ const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 const Thread = std.Thread;
-const c = std.c;
 
 const resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: keep-alive\r\n\r\n{\"message\":\"Hello, World!\"}";
 
 var total_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
-const MAX_EVENTS = 256;
-const MAX_WORKERS = 64;
+const ConnQueue = struct {
+    const CAP = 8192;
+    items: [CAP]posix.fd_t = [_]posix.fd_t{-1} ** CAP,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+    mutex: Thread.Mutex = .{},
+    not_empty: Thread.Condition = .{},
 
-/// Per-connection state
-const Conn = struct {
-    fd: posix.fd_t,
-    buf: [4096]u8 = undefined,
+    fn push(self: *ConnQueue, fd: posix.fd_t) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.count >= CAP) { posix.close(fd); return; }
+        self.items[self.tail] = fd;
+        self.tail = (self.tail + 1) % CAP;
+        self.count += 1;
+        self.not_empty.signal();
+    }
+
+    fn pop(self: *ConnQueue) posix.fd_t {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.count == 0) self.not_empty.wait(&self.mutex);
+        const fd = self.items[self.head];
+        self.head = (self.head + 1) % CAP;
+        self.count -= 1;
+        return fd;
+    }
 };
 
-/// Sub-reactor: owns a kqueue + a set of connections.
-/// Handles all I/O for its assigned connections.
-const Reactor = struct {
-    kq: posix.fd_t,
-    // New connections are pushed here by the main reactor
-    pending: PendingQueue = .{},
+var queue: ConnQueue = .{};
 
-    const PendingQueue = struct {
-        fds: [1024]posix.fd_t = undefined,
-        count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-        write_pos: usize = 0,
-        mutex: Thread.Mutex = .{},
-
-        fn push(self: *PendingQueue, fd: posix.fd_t) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const c2 = self.count.load(.monotonic);
-            if (c2 >= 1024) { posix.close(fd); return; }
-            self.fds[self.write_pos] = fd;
-            self.write_pos = (self.write_pos + 1) % 1024;
-            _ = self.count.fetchAdd(1, .release);
-        }
-    };
-
-    fn init() !Reactor {
-        const kq = try posix.kqueue();
-        return .{ .kq = kq };
-    }
-
-    /// Register a new fd with this reactor's kqueue
-    fn addFd(self: *Reactor, fd: posix.fd_t) void {
-        // Set non-blocking
-        const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
-        _ = posix.fcntl(fd, posix.F.SETFL, flags | @as(usize, 0x0004)) catch return; // O_NONBLOCK = 0x0004 on macOS
-        var changelist = [_]posix.Kevent{.{
-            .ident = @intCast(fd),
-            .filter = std.c.EVFILT.READ,
-            .flags = std.c.EV.ADD,
-            .fflags = 0,
-            .data = 0,
-            .udata = 0,
-        }};
-        _ = posix.kevent(self.kq, &changelist, &.{}, null) catch {};
-    }
-    /// Drain pending connections from main reactor
-    fn drainPending(self: *Reactor) void {
-        const cnt = self.pending.count.load(.acquire);
-        if (cnt == 0) return;
-
-        self.pending.mutex.lock();
-        defer self.pending.mutex.unlock();
-        const actual = self.pending.count.load(.monotonic);
-        if (actual == 0) return;
-
-        const start = if (self.pending.write_pos >= actual)
-            self.pending.write_pos - actual
-        else
-            self.pending.write_pos + 1024 - actual;
-
-        for (0..actual) |i| {
-            const idx = (start + i) % 1024;
-            self.addFd(self.pending.fds[idx]);
-        }
-        self.pending.count.store(0, .release);
-        self.pending.write_pos = 0;
-    }
-
-    /// Event loop: poll for I/O events, handle them
-    fn run(self: *Reactor) void {
-        var events: [MAX_EVENTS]posix.Kevent = undefined;
-        const timeout = posix.timespec{ .sec = 0, .nsec = 5_000_000 }; // 5ms
-
+fn worker() void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const fd = queue.pop();
+        // Keep-alive loop
         while (true) {
-            // Check for new connections from main reactor
-            self.drainPending();
-
-            const n = posix.kevent(self.kq, &.{}, &events, &timeout) catch continue;
-
-            for (events[0..n]) |ev| {
-                const fd: posix.fd_t = @intCast(ev.ident);
-
-                if (ev.flags & posix.system.EV.EOF != 0) {
-                    posix.close(fd);
-                    continue;
-                }
-
-                // Read
-                var buf: [4096]u8 = undefined;
-                const nr = posix.read(fd, &buf) catch {
-                    posix.close(fd);
-                    continue;
-                };
-                if (nr == 0) {
-                    posix.close(fd);
-                    continue;
-                }
-
-                // Write response
-                _ = posix.write(fd, resp) catch {
-                    posix.close(fd);
-                    continue;
-                };
-
-                _ = total_requests.fetchAdd(1, .monotonic);
-            }
+            const n = posix.read(fd, &buf) catch break;
+            if (n == 0) break;
+            _ = posix.write(fd, resp) catch break;
+            _ = total_requests.fetchAdd(1, .monotonic);
         }
+        posix.close(fd);
     }
-};
-
-var reactors: [MAX_WORKERS]Reactor = undefined;
-var num_reactors: usize = 0;
+}
 
 pub fn main() !void {
     const port: u16 = 8080;
-    const cpu_count = Thread.getCpuCount() catch 4;
-    num_reactors = @max(cpu_count / 2, 2); // use perf cores
+    const nw = Thread.getCpuCount() catch 4;
 
-    std.debug.print("=== Zag HTTP Server (kqueue reactor) ===\n", .{});
-    std.debug.print("Reactors: {d} (gnet-style sub-reactors)\n", .{num_reactors});
+    std.debug.print("=== Zag HTTP Server ===\n", .{});
+    std.debug.print("Workers: {d} | Single queue | Raw posix\n", .{nw});
     std.debug.print("wrk -t8 -c1000 -d10s http://127.0.0.1:{d}/\n\n", .{port});
 
-    // Init sub-reactors
-    for (0..num_reactors) |i| {
-        reactors[i] = try Reactor.init();
-    }
-
-    // Start sub-reactor threads
-    for (0..num_reactors) |i| {
-        _ = try Thread.spawn(.{}, Reactor.run, .{&reactors[i]});
-    }
-
-    // Stats
     _ = try Thread.spawn(.{}, struct {
         fn run() void {
             var last: u64 = 0;
@@ -171,7 +79,8 @@ pub fn main() !void {
         }
     }.run, .{});
 
-    // Main reactor: accept loop + distribute to sub-reactors
+    for (0..nw) |_| _ = try Thread.spawn(.{}, worker, .{});
+
     const addr = net.Address.parseIp4("0.0.0.0", port) catch return;
     const sockfd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
     posix.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
@@ -180,14 +89,10 @@ pub fn main() !void {
 
     std.debug.print("Listening on http://0.0.0.0:{d}\n\n", .{port});
 
-    var next: usize = 0;
     while (true) {
-        var client_addr: posix.sockaddr = undefined;
-        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-        const fd = posix.accept(sockfd, &client_addr, &addr_len, 0) catch continue;
-
-        // Round-robin distribute to sub-reactors
-        reactors[next].pending.push(fd);
-        next = (next + 1) % num_reactors;
+        var ca: posix.sockaddr = undefined;
+        var al: posix.socklen_t = @sizeOf(posix.sockaddr);
+        const fd = posix.accept(sockfd, &ca, &al, 0) catch continue;
+        queue.push(fd);
     }
 }
