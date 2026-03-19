@@ -75,8 +75,9 @@ pub const Worker = struct {
                 }
             },
             .suspended => {
-                // Fiber yielded — re-enqueue it so it can resume
-                self.local_queue.push(fiber);
+                // Fiber yielded — push to global queue for fair scheduling
+                // (local queue is LIFO which starves other fibers)
+                self.scheduler.global_queue.push(fiber);
             },
             else => {},
         }

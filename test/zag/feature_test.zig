@@ -170,30 +170,29 @@ pub fn main() !void {
         zag.deinitRuntime(allocator);
     }
     // --- Channel: backpressure (small buffer) ---
-    // --- Channel: larger buffer (backpressure deferred to later) ---
-    std.debug.print("Channel 3: Large buffer (cap=64)... ", .{});
+    std.debug.print("Channel 3: Backpressure (cap=2)... ", .{});
     {
         const sched = try zag.initRuntime(allocator, 1);
         _ = sched;
 
-        var ch = try Channel(u64).init(allocator, 64);
+        var ch = try Channel(u64).init(allocator, 2);
         defer ch.deinit();
         var total = std.atomic.Value(u64).init(0);
 
         {
             var scope = Scope.init(allocator);
             defer scope.deinit();
-            try scope.spawn(producer, .{ &ch, 50 });
+            try scope.spawn(producer, .{ &ch, 20 });
             try scope.spawn(consumer, .{ &ch, &total });
             try scope.join();
         }
 
-        // sum(1..50) = 1275
-        if (total.load(.acquire) != 1275) {
+        // sum(1..20) = 210
+        if (total.load(.acquire) != 210) {
             std.debug.print("FAIL (got {})\n", .{total.load(.acquire)});
             return error.TestFailed;
         }
-        std.debug.print("PASS (sum=1275)\n", .{});
+        std.debug.print("PASS (sum=210 through cap-2 channel)\n", .{});
         zag.deinitRuntime(allocator);
     }
 
@@ -251,7 +250,7 @@ pub fn main() !void {
         const sched = try zag.initRuntime(allocator, 1);
         _ = sched;
 
-        var ch = try Channel(u64).init(allocator, 64);
+        var ch = try Channel(u64).init(allocator, 4);
         defer ch.deinit();
         var rendered = std.atomic.Value(u64).init(0);
 
@@ -292,7 +291,7 @@ pub fn main() !void {
         const sched = try zag.initRuntime(allocator, 1);
         _ = sched;
 
-        var ch = try Channel(u64).init(allocator, 128);
+        var ch = try Channel(u64).init(allocator, 8);
         defer ch.deinit();
         var received = std.atomic.Value(u64).init(0);
 
