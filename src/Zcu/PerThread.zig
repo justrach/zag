@@ -1910,7 +1910,7 @@ pub fn discoverImport(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
-    if (!mem.endsWith(u8, import_string, ".zig") and !mem.endsWith(u8, import_string, ".zon")) {
+    if (!mem.endsWith(u8, import_string, ".zig") and !mem.endsWith(u8, import_string, ".zag") and !mem.endsWith(u8, import_string, ".zon")) {
         return .module;
     }
 
