@@ -1743,7 +1743,12 @@ fn getSegmentProt(segname: []const u8) macho.vm_prot_t {
 fn getSegmentRank(segname: []const u8) u8 {
     if (mem.eql(u8, segname, "__PAGEZERO")) return 0x0;
     if (mem.eql(u8, segname, "__LINKEDIT")) return 0xf;
-    if (mem.indexOf(u8, segname, "ZIG")) |_| return 0xe;
+    // ZIG segments: placed after all standard segments, before __LINKEDIT,
+    // in ascending vmaddr order matching initMetadata layout.
+    if (mem.eql(u8, segname, "__TEXT_ZIG")) return 0xa;
+    if (mem.eql(u8, segname, "__CONST_ZIG")) return 0xb;
+    if (mem.eql(u8, segname, "__DATA_ZIG")) return 0xc;
+    if (mem.eql(u8, segname, "__BSS_ZIG")) return 0xd;
     if (mem.startsWith(u8, segname, "__TEXT")) return 0x1;
     if (mem.startsWith(u8, segname, "__DATA_CONST")) return 0x2;
     if (mem.startsWith(u8, segname, "__DATA")) return 0x3;
