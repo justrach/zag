@@ -1,53 +1,42 @@
-//! EventLoop — per-thread kqueue event loop for fiber-aware I/O.
+//! EventLoop — per-thread kqueue/epoll event loop for fiber-aware I/O.
 //!
-//! When a fiber needs to read/write a socket, it registers the fd with
-//! the event loop, suspends itself, and the event loop resumes it when
-//! the fd is ready. This allows one thread to multiplex thousands of
-//! connections without blocking.
-//!
-//! Architecture:
-//!   - Each worker thread owns one EventLoop
-//!   - Fibers call io.read()/io.write() which register with kqueue + suspend
-//!   - The scheduler's worker loop polls kqueue between running fibers
-//!   - Ready fibers are re-enqueued to run
+//! On macOS/BSD: uses kqueue. On Linux: stub (epoll TODO).
+//! When a fiber needs to read/write a socket, it registers the fd,
+//! suspends itself, and the event loop resumes it when ready.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const Fiber = @import("Fiber.zag");
 
 const EventLoop = @This();
-
 const MAX_EVENTS = 256;
 
-/// Registered fd → fiber mapping
-const FdEntry = struct {
-    fiber: *Fiber,
-    fd: posix.fd_t,
+pub const supported = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+    else => false,
 };
 
-kq: posix.fd_t,
+const Kevent = if (supported) posix.Kevent else void;
+const fd_default: posix.fd_t = -1;
 
-/// Map from fd to waiting fiber (simple array — fd as index)
-/// For production, use a hash map. This works for fd < 65536.
-waiters: [65536]?*Fiber = [_]?*Fiber{null} ** 65536,
+kq: posix.fd_t = fd_default,
+waiters: if (supported) [65536]?*Fiber else void = if (supported) [_]?*Fiber{null} ** 65536 else {},
 
 pub fn init() !EventLoop {
-    return .{
-        .kq = try posix.kqueue(),
-    };
+    if (comptime !supported) return .{};
+    return .{ .kq = try posix.kqueue() };
 }
 
 pub fn deinit(self: *EventLoop) void {
+    if (comptime !supported) return;
     posix.close(self.kq);
 }
 
-/// Register fd for read readiness and suspend the current fiber.
-/// Returns when the fd is ready to read (non-blocking read will succeed).
 pub fn waitReadable(self: *EventLoop, fd: posix.fd_t) void {
+    if (comptime !supported) return;
     const fiber = Fiber.getCurrentFiber() orelse return;
-
-    // Register with kqueue
-    var changelist = [_]posix.Kevent{.{
+    var changelist = [_]Kevent{.{
         .ident = @intCast(fd),
         .filter = std.c.EVFILT.READ,
         .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
@@ -56,22 +45,15 @@ pub fn waitReadable(self: *EventLoop, fd: posix.fd_t) void {
         .udata = @intFromPtr(fiber),
     }};
     _ = posix.kevent(self.kq, &changelist, &.{}, null) catch return;
-
-    // Track the waiter
-    if (@as(usize, @intCast(fd)) < self.waiters.len) {
-        self.waiters[@intCast(fd)] = fiber;
-    }
-
-    // Suspend fiber — scheduler will resume us when kqueue fires
+    if (@as(usize, @intCast(fd)) < self.waiters.len) self.waiters[@intCast(fd)] = fiber;
     fiber.state = .parked_io;
     Fiber.switchToScheduler(fiber);
 }
 
-/// Register fd for write readiness and suspend the current fiber.
 pub fn waitWritable(self: *EventLoop, fd: posix.fd_t) void {
+    if (comptime !supported) return;
     const fiber = Fiber.getCurrentFiber() orelse return;
-
-    var changelist = [_]posix.Kevent{.{
+    var changelist = [_]Kevent{.{
         .ident = @intCast(fd),
         .filter = std.c.EVFILT.WRITE,
         .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
@@ -80,100 +62,57 @@ pub fn waitWritable(self: *EventLoop, fd: posix.fd_t) void {
         .udata = @intFromPtr(fiber),
     }};
     _ = posix.kevent(self.kq, &changelist, &.{}, null) catch return;
-
-    if (@as(usize, @intCast(fd)) < self.waiters.len) {
-        self.waiters[@intCast(fd)] = fiber;
-    }
-
+    if (@as(usize, @intCast(fd)) < self.waiters.len) self.waiters[@intCast(fd)] = fiber;
     fiber.state = .parked_io;
     Fiber.switchToScheduler(fiber);
 }
 
-/// Poll for ready I/O events. Returns fibers that are ready to resume.
-/// Called by the scheduler's worker loop between running fibers.
-/// Non-blocking: returns immediately if no events.
 pub fn poll(self: *EventLoop, ready_fibers: []?*Fiber) usize {
-    var events: [MAX_EVENTS]posix.Kevent = undefined;
-    const timeout = posix.timespec{ .sec = 0, .nsec = 0 }; // non-blocking
-
+    if (comptime !supported) return 0;
+    var events: [MAX_EVENTS]Kevent = undefined;
+    const timeout = posix.timespec{ .sec = 0, .nsec = 0 };
     const n = posix.kevent(self.kq, &.{}, &events, &timeout) catch return 0;
-
     var count: usize = 0;
     for (events[0..n]) |ev| {
-        // Recover fiber pointer from udata
         const fiber: *Fiber = @ptrFromInt(ev.udata);
-        if (count < ready_fibers.len) {
-            ready_fibers[count] = fiber;
-            count += 1;
-        }
-
-        // Clear waiter
+        if (count < ready_fibers.len) { ready_fibers[count] = fiber; count += 1; }
         const fd: usize = @intCast(ev.ident);
-        if (fd < self.waiters.len) {
-            self.waiters[fd] = null;
-        }
+        if (fd < self.waiters.len) self.waiters[fd] = null;
     }
-
     return count;
 }
 
-/// Poll with a timeout (milliseconds). Used when no fibers are runnable
-/// and we need to wait for I/O.
 pub fn pollWait(self: *EventLoop, ready_fibers: []?*Fiber, timeout_ms: u64) usize {
-    var events: [MAX_EVENTS]posix.Kevent = undefined;
+    if (comptime !supported) return 0;
+    var events: [MAX_EVENTS]Kevent = undefined;
     const timeout = posix.timespec{
         .sec = @intCast(timeout_ms / 1000),
         .nsec = @intCast((timeout_ms % 1000) * 1_000_000),
     };
-
     const n = posix.kevent(self.kq, &.{}, &events, &timeout) catch return 0;
-
     var count: usize = 0;
     for (events[0..n]) |ev| {
         const fiber: *Fiber = @ptrFromInt(ev.udata);
-        if (count < ready_fibers.len) {
-            ready_fibers[count] = fiber;
-            count += 1;
-        }
+        if (count < ready_fibers.len) { ready_fibers[count] = fiber; count += 1; }
         const fd: usize = @intCast(ev.ident);
-        if (fd < self.waiters.len) {
-            self.waiters[fd] = null;
-        }
+        if (fd < self.waiters.len) self.waiters[fd] = null;
     }
-
     return count;
 }
 
-/// Remove an fd from the event loop (e.g. on connection close).
 pub fn removeFd(self: *EventLoop, fd: posix.fd_t) void {
-    // Remove READ filter
-    var changelist = [_]posix.Kevent{.{
-        .ident = @intCast(fd),
-        .filter = std.c.EVFILT.READ,
-        .flags = std.c.EV.DELETE,
-        .fflags = 0,
-        .data = 0,
-        .udata = 0,
+    if (comptime !supported) return;
+    var changelist = [_]Kevent{.{
+        .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.DELETE,
+        .fflags = 0, .data = 0, .udata = 0,
     }};
     _ = posix.kevent(self.kq, &changelist, &.{}, null) catch {};
-
-    // Remove WRITE filter
     changelist[0].filter = std.c.EVFILT.WRITE;
     _ = posix.kevent(self.kq, &changelist, &.{}, null) catch {};
-
-    if (@as(usize, @intCast(fd)) < self.waiters.len) {
-        self.waiters[@intCast(fd)] = null;
-    }
+    if (@as(usize, @intCast(fd)) < self.waiters.len) self.waiters[@intCast(fd)] = null;
 }
-
-// --- Thread-local event loop ---
 
 threadlocal var current_event_loop: ?*EventLoop = null;
 
-pub fn getCurrent() ?*EventLoop {
-    return current_event_loop;
-}
-
-pub fn setCurrent(el: *EventLoop) void {
-    current_event_loop = el;
-}
+pub fn getCurrent() ?*EventLoop { return current_event_loop; }
+pub fn setCurrent(el: *EventLoop) void { current_event_loop = el; }
