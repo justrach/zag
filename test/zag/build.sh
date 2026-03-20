@@ -24,8 +24,10 @@ done
     cp "$src" "$dst"
 done
 
-# Fix imports: .zag → .zig
-find "$BUILD_DIR" -name "*.zig" -exec sed -i '' 's/\.zag"/\.zig"/g' {} \;
+# Fix imports: .zag → .zig (portable across macOS and Linux)
+find "$BUILD_DIR" -name "*.zig" -type f | while read -r f; do
+    sed 's/\.zag"/.zig"/g' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+done
 
 TARGET="${1:-http_bench}"
 OPT="${2:-ReleaseFast}"

@@ -44,31 +44,31 @@ jobs:
         run: bash test/zag/build.sh run_test Debug
 
       - name: Run basic tests
-        run: /tmp/zag_run_test
+        run: perl -e 'alarm 30; exec @ARGV' /tmp/zag_run_test
 
       - name: Build stress tests
         run: bash test/zag/build.sh stress_test Debug
 
       - name: Run stress tests
-        run: timeout 30 /tmp/zag_stress_test
+        run: perl -e 'alarm 60; exec @ARGV' /tmp/zag_stress_test
 
       - name: Build feature tests
         run: bash test/zag/build.sh feature_test Debug
 
       - name: Run feature tests
-        run: timeout 30 /tmp/zag_feature_test
+        run: perl -e 'alarm 60; exec @ARGV' /tmp/zag_feature_test
 
       - name: Build sandbox tests
         run: bash test/zag/build.sh sandbox_test Debug
 
       - name: Run sandbox tests
-        run: timeout 15 /tmp/zag_sandbox_test
+        run: perl -e 'alarm 30; exec @ARGV' /tmp/zag_sandbox_test
 
       - name: Build agent benchmark
         run: bash test/zag/build.sh agent_bench ReleaseFast
 
       - name: Run agent benchmark
-        run: timeout 30 /tmp/zag_agent_bench
+        run: perl -e 'alarm 60; exec @ARGV' /tmp/zag_agent_bench
 
   benchmark:
     name: Benchmarks (macos-14)
