@@ -9,7 +9,7 @@ on:
         default: zag-0.15.2
   push:
     tags:
-      - 'zag-*'
+      - 'zag-[0-9]*'  # matches zag-0.15.2 but NOT zag-rt-*
 
 permissions:
   contents: write
