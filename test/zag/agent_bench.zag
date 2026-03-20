@@ -197,6 +197,7 @@ fn multiAgentPlanner(num_tasks: u64, concurrency: u64) void {
 
 pub fn main() !void {
     allocator = std.heap.page_allocator;
+    std.fs.cwd().makePath(WORKDIR) catch {};
 
     std.debug.print("=== Zag Agent Orchestration Benchmark ===\n\n", .{});
 
