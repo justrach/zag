@@ -103,13 +103,13 @@ jobs:
         run: bash test/zag/build.sh benchmarks/orchestrator ReleaseFast
 
       - name: Run orchestrator benchmark
-        run: timeout 60 /tmp/zag_benchmarks_orchestrator
+        run: perl -e 'alarm 60; exec @ARGV' /tmp/zag_benchmarks_orchestrator
 
       - name: Build async patterns benchmark
         run: bash test/zag/build.sh benchmarks/async_patterns ReleaseFast
 
       - name: Run async patterns benchmark
-        run: timeout 60 /tmp/zag_benchmarks_async_patterns
+        run: perl -e 'alarm 60; exec @ARGV' /tmp/zag_benchmarks_async_patterns
 
   release:
     name: Create Release
