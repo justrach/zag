@@ -1,0 +1,98 @@
+//! Pure blocking thread pool — maximizing req/s.
+//!
+//! Build: test/zag/build.sh http_bench ReleaseFast
+//! Bench: wrk -t8 -c1000 -d10s http://127.0.0.1:8080/
+
+const std = @import("std");
+const net = std.net;
+const posix = std.posix;
+const Thread = std.Thread;
+
+const resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: keep-alive\r\n\r\n{\"message\":\"Hello, World!\"}";
+
+var total_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+const ConnQueue = struct {
+    const CAP = 8192;
+    items: [CAP]posix.fd_t = [_]posix.fd_t{-1} ** CAP,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+    mutex: Thread.Mutex = .{},
+    not_empty: Thread.Condition = .{},
+
+    fn push(self: *ConnQueue, fd: posix.fd_t) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.count >= CAP) { posix.close(fd); return; }
+        self.items[self.tail] = fd;
+        self.tail = (self.tail + 1) % CAP;
+        self.count += 1;
+        self.not_empty.signal();
+    }
+
+    fn pop(self: *ConnQueue) posix.fd_t {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.count == 0) self.not_empty.wait(&self.mutex);
+        const fd = self.items[self.head];
+        self.head = (self.head + 1) % CAP;
+        self.count -= 1;
+        return fd;
+    }
+};
+
+var queue: ConnQueue = .{};
+
+fn worker() void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const fd = queue.pop();
+        // Keep-alive loop
+        while (true) {
+            const n = posix.read(fd, &buf) catch break;
+            if (n == 0) break;
+            _ = posix.write(fd, resp) catch break;
+            _ = total_requests.fetchAdd(1, .monotonic);
+        }
+        posix.close(fd);
+    }
+}
+
+pub fn main() !void {
+    const port: u16 = 8080;
+    const nw = Thread.getCpuCount() catch 4;
+
+    std.debug.print("=== Zag HTTP Server ===\n", .{});
+    std.debug.print("Workers: {d} | Single queue | Raw posix\n", .{nw});
+    std.debug.print("wrk -t8 -c1000 -d10s http://127.0.0.1:{d}/\n\n", .{port});
+
+    _ = try Thread.spawn(.{}, struct {
+        fn run() void {
+            var last: u64 = 0;
+            while (true) {
+                std.Thread.sleep(1_000_000_000);
+                const cur = total_requests.load(.monotonic);
+                std.debug.print("[stats] {d} req/s | {d} total\n", .{ cur - last, cur });
+                last = cur;
+            }
+        }
+    }.run, .{});
+
+    for (0..nw) |_| _ = try Thread.spawn(.{}, worker, .{});
+
+    const addr = net.Address.parseIp4("0.0.0.0", port) catch return;
+    const sockfd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    posix.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    posix.bind(sockfd, &addr.any, addr.getOsSockLen()) catch return;
+    posix.listen(sockfd, 4096) catch return;
+
+    std.debug.print("Listening on http://0.0.0.0:{d}\n\n", .{port});
+
+    while (true) {
+        var ca: posix.sockaddr = undefined;
+        var al: posix.socklen_t = @sizeOf(posix.sockaddr);
+        const fd = posix.accept(sockfd, &ca, &al, 0) catch continue;
+        queue.push(fd);
+    }
+}
