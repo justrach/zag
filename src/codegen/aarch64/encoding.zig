@@ -15215,6 +15215,39 @@ pub const Instruction = packed union {
             .nop = .{},
         } } };
     }
+    // === LSE Atomic Instructions (ARMv8.1+, Apple Silicon) ===
+
+    /// LDADDAL <Xs>, <Xt>, [<Xn|SP>] — Atomic add, acquire+release (64-bit)
+    /// Atomically: old = *Xn; *Xn += Xs; Xt = old
+    pub fn ldaddal_x(rs: Register, rt: Register, rn: Register) Instruction {
+        return lseAtomic(0b11, 1, 1, 0b0000, rs, rt, rn);
+    }
+
+    /// LDADDAL <Ws>, <Wt>, [<Xn|SP>] — Atomic add, acquire+release (32-bit)
+    pub fn ldaddal_w(rs: Register, rt: Register, rn: Register) Instruction {
+        return lseAtomic(0b10, 1, 1, 0b0000, rs, rt, rn);
+    }
+
+    /// LDADD <Xs>, <Xt>, [<Xn|SP>] — Atomic add, relaxed (64-bit)
+    pub fn ldadd_x(rs: Register, rt: Register, rn: Register) Instruction {
+        return lseAtomic(0b11, 0, 0, 0b0000, rs, rt, rn);
+    }
+
+    /// SWPAL <Xs>, <Xt>, [<Xn|SP>] — Atomic swap, acquire+release (64-bit)
+    pub fn swpal_x(rs: Register, rt: Register, rn: Register) Instruction {
+        return lseAtomic(0b11, 1, 1, 0b0001, rs, rt, rn);
+    }
+
+    fn lseAtomic(sz: u2, A: u1, R: u1, opc: u4, rs: Register, rt: Register, rn: Register) Instruction {
+        // Encoding: size(2) | 111000 | A(1) | R(1) | 1 | Rs(5) | opc(4) | 00 | Rn(5) | Rt(5)
+        const rs5: u32 = @intFromEnum(rs.alias.encode(.{}));
+        const rt5: u32 = @intFromEnum(rt.alias.encode(.{}));
+        const rn5: u32 = @intFromEnum(rn.alias.encode(.{ .sp = true }));
+        const word: u32 = (@as(u32, sz) << 30) | (0b111000 << 24) | (@as(u32, A) << 23) |
+            (@as(u32, R) << 22) | (1 << 21) | (rs5 << 16) | (@as(u32, opc) << 12) |
+            (0b00 << 10) | (rn5 << 5) | rt5;
+        return @bitCast(word);
+    }
     /// C7.2.210 NOT
     pub fn not(d: Register, n: Register) Instruction {
         const arrangement = d.format.vector;
