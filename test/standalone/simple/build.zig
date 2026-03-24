@@ -124,4 +124,8 @@ const cases = [_]Case{
         .os_filter = .windows,
         .link_libc = true,
     },
+    .{
+        .src_path = "atomic_rmw/main.zig",
+        .all_modes = true,
+    },
 };
