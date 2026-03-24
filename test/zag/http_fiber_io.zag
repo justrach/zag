@@ -1,0 +1,124 @@
+//! Fiber-aware I/O HTTP server — kqueue under the hood, blocking API on top.
+//!
+//! Each connection is a fiber. read()/write() suspend the fiber via kqueue
+//! instead of blocking the OS thread. One thread can multiplex thousands
+//! of connections.
+//!
+//! This is the ZEP-0002 vision: handleConnection is a plain function,
+//! no async, no Io parameter. The fiber runtime handles everything.
+//!
+//! Build: test/zag/build.sh http_fiber_io ReleaseFast
+//! Bench: wrk -t8 -c1000 -d10s http://127.0.0.1:8080/
+
+const std = @import("std");
+const zag = @import("zag");
+const net = std.net;
+const posix = std.posix;
+const Thread = std.Thread;
+const Fiber = zag.Fiber;
+const Scheduler = zag.Scheduler;
+const EventLoop = zag.EventLoop;
+const io = zag.io;
+
+const resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: keep-alive\r\n\r\n{\"message\":\"Hello, World!\"}";
+
+var total_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var active_conns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var global_allocator: std.mem.Allocator = undefined;
+
+/// Handle one connection — plain function, fiber-aware I/O.
+fn handleConnection(fd: posix.fd_t) void {
+    defer posix.close(fd);
+    defer _ = active_conns.fetchSub(1, .monotonic);
+    _ = active_conns.fetchAdd(1, .monotonic);
+
+    io.setNonBlocking(fd);
+
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = io.read(fd, &buf) catch break;
+        _ = n;
+        io.writeAll(fd, resp) catch break;
+        _ = total_requests.fetchAdd(1, .monotonic);
+    }
+}
+
+/// Accept loop fiber.
+fn acceptLoop(listen_fd: posix.fd_t) void {
+    io.setNonBlocking(listen_fd);
+
+    while (true) {
+        const client_fd = io.accept(listen_fd) catch continue;
+
+        const sched = Scheduler.getGlobal() orelse continue;
+        const fiber = global_allocator.create(Fiber) catch {
+            posix.close(client_fd);
+            continue;
+        };
+        fiber.* = Fiber.init(global_allocator, Fiber.default_stack_size) catch {
+            global_allocator.destroy(fiber);
+            posix.close(client_fd);
+            continue;
+        };
+        fiber.setup(handleConnection, .{client_fd});
+        sched.submit(fiber);
+    }
+}
+
+pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+    global_allocator = allocator;
+    const port: u16 = 8080;
+    const cpu_count = Thread.getCpuCount() catch 4;
+    const num_workers = cpu_count;
+
+    std.debug.print("=== Zag Fiber I/O HTTP Server ===\n", .{});
+    std.debug.print("Workers: {d} | kqueue per-thread | Fiber-aware I/O\n", .{num_workers});
+    std.debug.print("wrk -t8 -c1000 -d10s http://127.0.0.1:{d}/\n\n", .{port});
+
+    // Init scheduler with workers (each has its own kqueue)
+    const sched = try allocator.create(Scheduler);
+    sched.* = try Scheduler.init(allocator, num_workers);
+    sched.workers = try allocator.alloc(Scheduler.Worker, num_workers);
+    for (sched.workers.?, 0..) |*worker, i| {
+        worker.* = Scheduler.Worker.init(i, sched);
+    }
+    Scheduler.setGlobal(sched);
+
+    // Start worker threads (skip 0 — main thread)
+    for (sched.workers.?[1..]) |*worker| {
+        worker.thread = try Thread.spawn(.{}, Scheduler.Worker.run, .{worker});
+    }
+
+    // Stats thread
+    _ = try Thread.spawn(.{}, struct {
+        fn run() void {
+            var last: u64 = 0;
+            while (true) {
+                std.Thread.sleep(1_000_000_000);
+                const cur = total_requests.load(.monotonic);
+                const conns = active_conns.load(.monotonic);
+                std.debug.print("[stats] {d} req/s | {d} total | {d} conns\n", .{ cur - last, cur, conns });
+                last = cur;
+            }
+        }
+    }.run, .{});
+
+    // Create listen socket
+    const addr = net.Address.parseIp4("0.0.0.0", port) catch return;
+    const sockfd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    posix.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    posix.bind(sockfd, &addr.any, addr.getOsSockLen()) catch return;
+    posix.listen(sockfd, 4096) catch return;
+
+    std.debug.print("Listening on http://0.0.0.0:{d}\n\n", .{port});
+
+    // Spawn accept loop as a fiber on worker 0
+    const accept_fiber = try allocator.create(Fiber);
+    accept_fiber.* = try Fiber.init(allocator, Fiber.default_stack_size);
+    accept_fiber.setup(acceptLoop, .{sockfd});
+    sched.submit(accept_fiber);
+
+    // Main thread runs as worker 0
+    sched.workers.?[0].run();
+}

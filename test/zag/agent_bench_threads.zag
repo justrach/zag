@@ -1,0 +1,182 @@
+//! Agent orchestration using OS threads — baseline comparison for fibers.
+//!
+//! Same workload as agent_bench.zag but using std.Thread instead of fibers.
+//! This shows the overhead of OS threads vs fibers for agent fan-out.
+//!
+//! Build: test/zag/build.sh agent_bench_threads ReleaseFast
+
+const std = @import("std");
+const Thread = std.Thread;
+const fs = std.fs;
+
+const WORKDIR = "/tmp/zag_agent_workdir_threads";
+
+var total_ops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+// ============================================================
+// Same tool agents — identical logic, just plain functions
+// ============================================================
+
+fn fileWriterAgent(path: [*:0]const u8, content: []const u8) void {
+    const file = fs.cwd().createFileZ(path, .{}) catch return;
+    defer file.close();
+    file.writeAll(content) catch return;
+    _ = total_ops.fetchAdd(1, .monotonic);
+}
+
+fn fileReaderAgent(path: [*:0]const u8) void {
+    const file = fs.cwd().openFileZ(path, .{}) catch return;
+    defer file.close();
+    var buf: [8192]u8 = undefined;
+    _ = file.readAll(&buf) catch return;
+    _ = total_ops.fetchAdd(1, .monotonic);
+}
+
+fn codeSearchAgent(path: [*:0]const u8) void {
+    const file = fs.cwd().openFileZ(path, .{}) catch return;
+    defer file.close();
+    var buf: [8192]u8 = undefined;
+    const n = file.readAll(&buf) catch return;
+    const content = buf[0..n];
+
+    var pos: usize = 0;
+    while (pos < content.len) {
+        const line_end = std.mem.indexOf(u8, content[pos..], "\n") orelse content.len - pos;
+        const line = content[pos..pos + line_end];
+        if (std.mem.indexOf(u8, line, "ctx")) |_| {
+            _ = total_ops.fetchAdd(1, .monotonic);
+        }
+        pos += line_end + 1;
+    }
+}
+
+fn transformerAgent(input_path: [*:0]const u8, output_path: [*:0]const u8) void {
+    const in_file = fs.cwd().openFileZ(input_path, .{}) catch return;
+    defer in_file.close();
+    var buf: [8192]u8 = undefined;
+    const n = in_file.readAll(&buf) catch return;
+    _ = total_ops.fetchAdd(1, .monotonic);
+
+    var out_buf: [8192]u8 = undefined;
+    for (buf[0..n], 0..) |c, i| {
+        out_buf[i] = std.ascii.toUpper(c);
+    }
+
+    const out_file = fs.cwd().createFileZ(output_path, .{}) catch return;
+    defer out_file.close();
+    out_file.writeAll(out_buf[0..n]) catch return;
+    _ = total_ops.fetchAdd(1, .monotonic);
+}
+
+fn validatorAgent(path: [*:0]const u8) void {
+    const file = fs.cwd().openFileZ(path, .{}) catch return;
+    defer file.close();
+    var buf: [8192]u8 = undefined;
+    const n = file.readAll(&buf) catch return;
+    for (buf[0..n]) |c| {
+        if (std.ascii.isLower(c)) return;
+    }
+    _ = total_ops.fetchAdd(1, .monotonic);
+}
+
+// ============================================================
+// Thread-based planner — spawn OS threads for each agent
+// ============================================================
+
+fn plannerTaskThreaded(task_id: u64) void {
+    var path_buf: [256]u8 = undefined;
+    const src_path = std.fmt.bufPrintZ(&path_buf, WORKDIR ++ "/task_{d}_src.txt", .{task_id}) catch return;
+
+    var out_path_buf: [256]u8 = undefined;
+    const out_path = std.fmt.bufPrintZ(&out_path_buf, WORKDIR ++ "/task_{d}_out.txt", .{task_id}) catch return;
+
+    // Write source
+    const content = "fn handleRequest(ctx: *Context) void {\n    const data = ctx.readBody();\n    const result = processData(data);\n    ctx.sendResponse(result);\n}\n";
+    fileWriterAgent(src_path, content);
+
+    // Fan out with OS threads
+    const t1 = Thread.spawn(.{}, fileReaderAgent, .{src_path}) catch return;
+    const t2 = Thread.spawn(.{}, codeSearchAgent, .{src_path}) catch return;
+    const t3 = Thread.spawn(.{}, transformerAgent, .{ src_path, out_path }) catch return;
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    // Validate (sequential)
+    validatorAgent(out_path);
+}
+
+fn multiPlannerThreaded(num_tasks: u64, concurrency: u64) void {
+    var completed: u64 = 0;
+    while (completed < num_tasks) {
+        const batch = @min(concurrency, num_tasks - completed);
+        var threads: [64]Thread = undefined;
+
+        for (0..batch) |i| {
+            threads[i] = Thread.spawn(.{}, plannerTaskThreaded, .{completed + i}) catch continue;
+        }
+        for (0..batch) |i| {
+            threads[i].join();
+        }
+        completed += batch;
+    }
+}
+
+// ============================================================
+// Sequential baseline — no parallelism at all
+// ============================================================
+
+fn plannerTaskSequential(task_id: u64) void {
+    var path_buf: [256]u8 = undefined;
+    const src_path = std.fmt.bufPrintZ(&path_buf, WORKDIR ++ "/task_{d}_src.txt", .{task_id}) catch return;
+
+    var out_path_buf: [256]u8 = undefined;
+    const out_path = std.fmt.bufPrintZ(&out_path_buf, WORKDIR ++ "/task_{d}_out.txt", .{task_id}) catch return;
+
+    const content = "fn handleRequest(ctx: *Context) void {\n    const data = ctx.readBody();\n    const result = processData(data);\n    ctx.sendResponse(result);\n}\n";
+    fileWriterAgent(src_path, content);
+    fileReaderAgent(src_path);
+    codeSearchAgent(src_path);
+    transformerAgent(src_path, out_path);
+    validatorAgent(out_path);
+}
+
+pub fn main() !void {
+    fs.cwd().makePath(WORKDIR) catch {};
+
+    std.debug.print("=== Agent Benchmark: Fibers vs Threads vs Sequential ===\n\n", .{});
+    const n: u64 = 100;
+    const conc: u64 = 20;
+
+    // --- Sequential ---
+    std.debug.print("Sequential ({d} tasks, no parallelism)... ", .{n});
+    {
+        total_ops.store(0, .monotonic);
+        const start = std.time.nanoTimestamp();
+        for (0..n) |i| plannerTaskSequential(i);
+        const elapsed_us = @divTrunc(std.time.nanoTimestamp() - start, 1000);
+        const tps = if (elapsed_us > 0) @divTrunc(@as(i128, n) * 1_000_000, elapsed_us) else 0;
+        std.debug.print("{d} tasks/sec ({d}µs, {d} ops)\n", .{ tps, elapsed_us, total_ops.load(.monotonic) });
+    }
+
+    // --- OS Threads ---
+    std.debug.print("OS Threads ({d} tasks, {d} concurrent)... ", .{ n, conc });
+    {
+        total_ops.store(0, .monotonic);
+        const start = std.time.nanoTimestamp();
+        multiPlannerThreaded(n, conc);
+        const elapsed_us = @divTrunc(std.time.nanoTimestamp() - start, 1000);
+        const tps = if (elapsed_us > 0) @divTrunc(@as(i128, n) * 1_000_000, elapsed_us) else 0;
+        std.debug.print("{d} tasks/sec ({d}µs, {d} ops)\n", .{ tps, elapsed_us, total_ops.load(.monotonic) });
+    }
+
+    // Memory comparison
+    std.debug.print("\n--- Memory ---\n", .{});
+    std.debug.print("OS Thread stack:  8 MB × 3 agents × {d} concurrent = {d} MB\n", .{ conc, 8 * 3 * conc });
+    std.debug.print("Fiber stack:     16 KB × 3 agents × {d} concurrent = {d} KB\n", .{ conc, 16 * 3 * conc });
+    std.debug.print("Ratio: {d}× less memory with fibers\n", .{8 * 1024 / 16});
+
+    fs.cwd().deleteTree(WORKDIR) catch {};
+    std.debug.print("\n=== Done ===\n", .{});
+}

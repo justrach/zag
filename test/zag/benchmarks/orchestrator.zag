@@ -1,0 +1,572 @@
+//! Orchestrator + Worker Agent benchmark with file locking.
+//!
+//! Simulates a multi-agent system (like zigharness):
+//!   - Orchestrator dispatches tasks from a DAG to worker agents
+//!   - Workers read/write shared files with reader-writer locks
+//!   - Some tasks depend on others (must wait for predecessors)
+//!   - File locks prevent data races between concurrent agents
+//!
+//! Compares: Fibers vs OS Threads vs Sequential
+//!
+//! Build: test/zag/build.sh benchmarks/orchestrator ReleaseFast
+
+const std = @import("std");
+const zag = @import("zag");
+const Scope = zag.Scope;
+const Channel = zag.Channel;
+const Mutex = zag.Mutex;
+const Thread = std.Thread;
+const fs = std.fs;
+
+const WORKDIR = "/tmp/zag_orch_bench";
+
+// ============================================================
+// File lock registry — reader-writer locks per file path
+// ============================================================
+
+const FileLock = struct {
+    readers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    writer: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    mutex: Thread.Mutex = .{},
+
+    fn readLock(self: *FileLock) void {
+        while (true) {
+            self.mutex.lock();
+            if (!self.writer.load(.monotonic)) {
+                _ = self.readers.fetchAdd(1, .release);
+                self.mutex.unlock();
+                return;
+            }
+            self.mutex.unlock();
+            zag.yield();
+        }
+    }
+
+    fn readUnlock(self: *FileLock) void {
+        _ = self.readers.fetchSub(1, .release);
+    }
+
+    fn writeLock(self: *FileLock) void {
+        while (true) {
+            self.mutex.lock();
+            if (!self.writer.load(.monotonic) and self.readers.load(.monotonic) == 0) {
+                self.writer.store(true, .release);
+                self.mutex.unlock();
+                return;
+            }
+            self.mutex.unlock();
+            zag.yield();
+        }
+    }
+
+    fn writeUnlock(self: *FileLock) void {
+        self.writer.store(false, .release);
+    }
+};
+
+/// Thread-based file lock (uses Thread.yield instead of zag.yield)
+const ThreadFileLock = struct {
+    readers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    writer: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    mutex: Thread.Mutex = .{},
+
+    fn readLock(self: *ThreadFileLock) void {
+        while (true) {
+            self.mutex.lock();
+            if (!self.writer.load(.monotonic)) {
+                _ = self.readers.fetchAdd(1, .release);
+                self.mutex.unlock();
+                return;
+            }
+            self.mutex.unlock();
+            Thread.yield() catch {};
+        }
+    }
+
+    fn readUnlock(self: *ThreadFileLock) void {
+        _ = self.readers.fetchSub(1, .release);
+    }
+
+    fn writeLock(self: *ThreadFileLock) void {
+        while (true) {
+            self.mutex.lock();
+            if (!self.writer.load(.monotonic) and self.readers.load(.monotonic) == 0) {
+                self.writer.store(true, .release);
+                self.mutex.unlock();
+                return;
+            }
+            self.mutex.unlock();
+            Thread.yield() catch {};
+        }
+    }
+
+    fn writeUnlock(self: *ThreadFileLock) void {
+        self.writer.store(false, .release);
+    }
+};
+
+// ============================================================
+// Task definitions
+// ============================================================
+
+const TaskKind = enum {
+    read_file,
+    write_file,
+    transform,    // read → process → write
+    merge,        // read N files → write 1
+    validate,     // read and check
+};
+
+const Task = struct {
+    id: u32,
+    kind: TaskKind,
+    file_id: u32,        // which file to operate on
+    depends_on: ?u32,    // task ID this depends on (null = ready)
+};
+
+// Global state
+var file_locks: [32]FileLock = [_]FileLock{.{}} ** 32;
+var thread_file_locks: [32]ThreadFileLock = [_]ThreadFileLock{.{}} ** 32;
+var completed_tasks: [256]std.atomic.Value(bool) = init_completed();
+var total_ops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var global_alloc: std.mem.Allocator = undefined;
+
+fn init_completed() [256]std.atomic.Value(bool) {
+    var arr: [256]std.atomic.Value(bool) = undefined;
+    for (&arr) |*v| v.* = std.atomic.Value(bool).init(false);
+    return arr;
+}
+
+fn resetCompleted() void {
+    for (&completed_tasks) |*v| v.store(false, .monotonic);
+    total_ops.store(0, .monotonic);
+}
+
+fn filePath(buf: []u8, file_id: u32) []u8 {
+    return std.fmt.bufPrint(buf, WORKDIR ++ "/file_{d}.txt", .{file_id}) catch buf[0..0];
+}
+
+// ============================================================
+// Fiber-based worker agent
+// ============================================================
+
+fn fiberWorker(task: Task) void {
+    // Wait for dependency
+    if (task.depends_on) |dep| {
+        while (!completed_tasks[dep].load(.acquire)) {
+            zag.yield();
+        }
+    }
+
+    var path_buf: [256]u8 = undefined;
+    const path = filePath(&path_buf, task.file_id);
+
+    switch (task.kind) {
+        .read_file => {
+            file_locks[task.file_id].readLock();
+            defer file_locks[task.file_id].readUnlock();
+
+            const f = fs.cwd().openFile(path, .{}) catch return;
+            defer f.close();
+            var buf: [4096]u8 = undefined;
+            _ = f.readAll(&buf) catch return;
+            _ = total_ops.fetchAdd(1, .monotonic);
+        },
+        .write_file => {
+            file_locks[task.file_id].writeLock();
+            defer file_locks[task.file_id].writeUnlock();
+
+            const f = fs.cwd().createFile(path, .{}) catch return;
+            defer f.close();
+            var content: [128]u8 = undefined;
+            const c = std.fmt.bufPrint(&content, "task {d} wrote this at file {d}\n", .{ task.id, task.file_id }) catch return;
+            f.writeAll(c) catch return;
+            _ = total_ops.fetchAdd(1, .monotonic);
+        },
+        .transform => {
+            // Read with read lock
+            var data: [4096]u8 = undefined;
+            var data_len: usize = 0;
+            {
+                file_locks[task.file_id].readLock();
+                defer file_locks[task.file_id].readUnlock();
+                const f = fs.cwd().openFile(path, .{}) catch return;
+                defer f.close();
+                data_len = f.readAll(&data) catch return;
+                _ = total_ops.fetchAdd(1, .monotonic);
+            }
+
+            // Process (uppercase)
+            for (data[0..data_len]) |*c| c.* = std.ascii.toUpper(c.*);
+
+            // Write with write lock
+            {
+                file_locks[task.file_id].writeLock();
+                defer file_locks[task.file_id].writeUnlock();
+                const f = fs.cwd().createFile(path, .{}) catch return;
+                defer f.close();
+                f.writeAll(data[0..data_len]) catch return;
+                _ = total_ops.fetchAdd(1, .monotonic);
+            }
+        },
+        .merge => {
+            // Read from file_id and file_id+1, merge into file_id
+            var buf1: [4096]u8 = undefined;
+            var buf2: [4096]u8 = undefined;
+            var len1: usize = 0;
+            var len2: usize = 0;
+            {
+                file_locks[task.file_id].readLock();
+                defer file_locks[task.file_id].readUnlock();
+                const f = fs.cwd().openFile(path, .{}) catch return;
+                defer f.close();
+                len1 = f.readAll(&buf1) catch return;
+            }
+            {
+                var p2: [256]u8 = undefined;
+                const path2 = filePath(&p2, task.file_id + 1);
+                file_locks[task.file_id + 1].readLock();
+                defer file_locks[task.file_id + 1].readUnlock();
+                const f = fs.cwd().openFile(path2, .{}) catch return;
+                defer f.close();
+                len2 = f.readAll(&buf2) catch return;
+            }
+            {
+                file_locks[task.file_id].writeLock();
+                defer file_locks[task.file_id].writeUnlock();
+                const f = fs.cwd().createFile(path, .{}) catch return;
+                defer f.close();
+                f.writeAll(buf1[0..len1]) catch return;
+                f.writeAll(buf2[0..len2]) catch return;
+                _ = total_ops.fetchAdd(2, .monotonic);
+            }
+        },
+        .validate => {
+            file_locks[task.file_id].readLock();
+            defer file_locks[task.file_id].readUnlock();
+            const f = fs.cwd().openFile(path, .{}) catch return;
+            defer f.close();
+            var buf: [4096]u8 = undefined;
+            _ = f.readAll(&buf) catch return;
+            _ = total_ops.fetchAdd(1, .monotonic);
+        },
+    }
+
+    completed_tasks[task.id].store(true, .release);
+}
+
+// ============================================================
+// Thread-based worker agent (same logic, Thread.yield)
+// ============================================================
+
+fn threadWorker(task: Task) void {
+    if (task.depends_on) |dep| {
+        while (!completed_tasks[dep].load(.acquire)) {
+            Thread.yield() catch {};
+        }
+    }
+
+    var path_buf: [256]u8 = undefined;
+    const path = filePath(&path_buf, task.file_id);
+
+    switch (task.kind) {
+        .read_file => {
+            thread_file_locks[task.file_id].readLock();
+            defer thread_file_locks[task.file_id].readUnlock();
+            const f = fs.cwd().openFile(path, .{}) catch return;
+            defer f.close();
+            var buf: [4096]u8 = undefined;
+            _ = f.readAll(&buf) catch return;
+            _ = total_ops.fetchAdd(1, .monotonic);
+        },
+        .write_file => {
+            thread_file_locks[task.file_id].writeLock();
+            defer thread_file_locks[task.file_id].writeUnlock();
+            const f = fs.cwd().createFile(path, .{}) catch return;
+            defer f.close();
+            var content: [128]u8 = undefined;
+            const c = std.fmt.bufPrint(&content, "task {d} wrote this at file {d}\n", .{ task.id, task.file_id }) catch return;
+            f.writeAll(c) catch return;
+            _ = total_ops.fetchAdd(1, .monotonic);
+        },
+        .transform => {
+            var data: [4096]u8 = undefined;
+            var data_len: usize = 0;
+            {
+                thread_file_locks[task.file_id].readLock();
+                defer thread_file_locks[task.file_id].readUnlock();
+                const f = fs.cwd().openFile(path, .{}) catch return;
+                defer f.close();
+                data_len = f.readAll(&data) catch return;
+                _ = total_ops.fetchAdd(1, .monotonic);
+            }
+            for (data[0..data_len]) |*c| c.* = std.ascii.toUpper(c.*);
+            {
+                thread_file_locks[task.file_id].writeLock();
+                defer thread_file_locks[task.file_id].writeUnlock();
+                const f = fs.cwd().createFile(path, .{}) catch return;
+                defer f.close();
+                f.writeAll(data[0..data_len]) catch return;
+                _ = total_ops.fetchAdd(1, .monotonic);
+            }
+        },
+        .merge => {
+            var buf1: [4096]u8 = undefined;
+            var buf2: [4096]u8 = undefined;
+            var len1: usize = 0;
+            var len2: usize = 0;
+            {
+                thread_file_locks[task.file_id].readLock();
+                defer thread_file_locks[task.file_id].readUnlock();
+                const f = fs.cwd().openFile(path, .{}) catch return;
+                defer f.close();
+                len1 = f.readAll(&buf1) catch return;
+            }
+            {
+                var p2: [256]u8 = undefined;
+                const path2 = filePath(&p2, task.file_id + 1);
+                thread_file_locks[task.file_id + 1].readLock();
+                defer thread_file_locks[task.file_id + 1].readUnlock();
+                const f = fs.cwd().openFile(path2, .{}) catch return;
+                defer f.close();
+                len2 = f.readAll(&buf2) catch return;
+            }
+            {
+                thread_file_locks[task.file_id].writeLock();
+                defer thread_file_locks[task.file_id].writeUnlock();
+                const f = fs.cwd().createFile(path, .{}) catch return;
+                defer f.close();
+                f.writeAll(buf1[0..len1]) catch return;
+                f.writeAll(buf2[0..len2]) catch return;
+                _ = total_ops.fetchAdd(2, .monotonic);
+            }
+        },
+        .validate => {
+            thread_file_locks[task.file_id].readLock();
+            defer thread_file_locks[task.file_id].readUnlock();
+            const f = fs.cwd().openFile(path, .{}) catch return;
+            defer f.close();
+            var buf: [4096]u8 = undefined;
+            _ = f.readAll(&buf) catch return;
+            _ = total_ops.fetchAdd(1, .monotonic);
+        },
+    }
+
+    completed_tasks[task.id].store(true, .release);
+}
+
+// ============================================================
+// Task DAG generator
+// ============================================================
+
+fn generateTaskDAG(tasks: []Task, num_files: u32, rounds: u32) usize {
+    var id: u32 = 0;
+
+    // Round 1: Write initial files (no dependencies)
+    var r: u32 = 0;
+    while (r < rounds) : (r += 1) {
+        var f: u32 = 0;
+        while (f < num_files) : (f += 1) {
+            if (id >= tasks.len) return id;
+            tasks[id] = .{ .id = id, .kind = .write_file, .file_id = f, .depends_on = null };
+            id += 1;
+        }
+
+        // Parallel reads (depend on writes)
+        const write_base = id - num_files;
+        f = 0;
+        while (f < num_files) : (f += 1) {
+            if (id >= tasks.len) return id;
+            tasks[id] = .{ .id = id, .kind = .read_file, .file_id = f, .depends_on = write_base + f };
+            id += 1;
+        }
+
+        // Transforms (depend on reads)
+        const read_base = id - num_files;
+        f = 0;
+        while (f < num_files) : (f += 1) {
+            if (id >= tasks.len) return id;
+            tasks[id] = .{ .id = id, .kind = .transform, .file_id = f, .depends_on = read_base + f };
+            id += 1;
+        }
+
+        // Merge pairs (depend on transforms)
+        const transform_base = id - num_files;
+        f = 0;
+        while (f + 1 < num_files) : (f += 2) {
+            if (id >= tasks.len) return id;
+            tasks[id] = .{ .id = id, .kind = .merge, .file_id = f, .depends_on = transform_base + f };
+            id += 1;
+        }
+
+        // Validate all (depend on merges/transforms)
+        const prev_id = id - 1;
+        f = 0;
+        while (f < num_files) : (f += 1) {
+            if (id >= tasks.len) return id;
+            tasks[id] = .{ .id = id, .kind = .validate, .file_id = f, .depends_on = prev_id };
+            id += 1;
+        }
+    }
+
+    return id;
+}
+
+// ============================================================
+// Benchmark runners
+// ============================================================
+
+fn runFiberBench(tasks: []const Task, n: usize) u64 {
+    resetCompleted();
+    _ = zag.initRuntime(global_alloc, 1) catch return 0;
+
+    const start = std.time.nanoTimestamp();
+    {
+        var scope = Scope.init(global_alloc);
+        defer scope.deinit();
+        for (tasks[0..n]) |task| {
+            scope.spawn(fiberWorker, .{task}) catch continue;
+        }
+        scope.join() catch {};
+    }
+    const elapsed_us: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - start, 1000));
+
+    zag.deinitRuntime(global_alloc);
+    return elapsed_us;
+}
+
+fn runThreadBench(tasks: []const Task, n: usize) u64 {
+    resetCompleted();
+
+    const start = std.time.nanoTimestamp();
+
+    // Batch threads (max 64 concurrent)
+    var i: usize = 0;
+    while (i < n) {
+        const batch = @min(n - i, 64);
+        var threads: [64]Thread = undefined;
+        for (0..batch) |j| {
+            threads[j] = Thread.spawn(.{}, threadWorker, .{tasks[i + j]}) catch continue;
+        }
+        for (0..batch) |j| threads[j].join();
+        i += batch;
+    }
+
+    const elapsed_us: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - start, 1000));
+    return elapsed_us;
+}
+
+fn runSequentialBench(tasks: []const Task, n: usize) u64 {
+    resetCompleted();
+    const start = std.time.nanoTimestamp();
+    for (tasks[0..n]) |task| {
+        // Sequential: ignore dependencies, just run in order
+        var t = task;
+        t.depends_on = null;
+        threadWorker(t);
+    }
+    const elapsed_us: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - start, 1000));
+    return elapsed_us;
+}
+
+pub fn main() !void {
+    global_alloc = std.heap.page_allocator;
+    fs.cwd().makePath(WORKDIR) catch {};
+
+    std.debug.print("=== Orchestrator + Worker Agent Benchmark ===\n", .{});
+    std.debug.print("Task DAG: write → read → transform → merge → validate\n", .{});
+    std.debug.print("File locking: reader-writer per file\n\n", .{});
+
+    // Generate task DAG
+    var tasks: [256]Task = undefined;
+    const num_files: u32 = 8;
+    const rounds: u32 = 10;
+    const n = generateTaskDAG(&tasks, num_files, rounds);
+
+    std.debug.print("DAG: {d} tasks, {d} files, {d} rounds\n\n", .{ n, num_files, rounds });
+
+    // --- Sequential ---
+    std.debug.print("Sequential...\n", .{});
+    const seq_us = runSequentialBench(&tasks, n);
+    const seq_ops = total_ops.load(.monotonic);
+    std.debug.print("  {d}µs | {d} ops | {d} tasks/sec\n\n", .{
+        seq_us, seq_ops, if (seq_us > 0) @divTrunc(@as(u128, n) * 1_000_000, seq_us) else 0,
+    });
+
+    // --- OS Threads ---
+    std.debug.print("OS Threads (64 concurrent max)...\n", .{});
+    const thr_us = runThreadBench(&tasks, n);
+    const thr_ops = total_ops.load(.monotonic);
+    std.debug.print("  {d}µs | {d} ops | {d} tasks/sec\n\n", .{
+        thr_us, thr_ops, if (thr_us > 0) @divTrunc(@as(u128, n) * 1_000_000, thr_us) else 0,
+    });
+
+    // --- Fibers ---
+    std.debug.print("Fibers (zag runtime)...\n", .{});
+    const fib_us = runFiberBench(&tasks, n);
+    const fib_ops = total_ops.load(.monotonic);
+    std.debug.print("  {d}µs | {d} ops | {d} tasks/sec\n\n", .{
+        fib_us, fib_ops, if (fib_us > 0) @divTrunc(@as(u128, n) * 1_000_000, fib_us) else 0,
+    });
+
+    // --- Summary ---
+    std.debug.print("=== Summary ({d} tasks with file locking) ===\n", .{n});
+    std.debug.print("  Sequential:  {d}µs\n", .{seq_us});
+    std.debug.print("  OS Threads:  {d}µs", .{thr_us});
+    if (seq_us > 0) std.debug.print("  ({d:.1}x vs sequential)", .{@as(f64, @floatFromInt(seq_us)) / @as(f64, @floatFromInt(@max(thr_us, 1)))});
+    std.debug.print("\n", .{});
+    std.debug.print("  Fibers:      {d}µs", .{fib_us});
+    if (seq_us > 0) std.debug.print("  ({d:.1}x vs sequential)", .{@as(f64, @floatFromInt(seq_us)) / @as(f64, @floatFromInt(@max(fib_us, 1)))});
+    std.debug.print("\n", .{});
+    if (thr_us > 0) std.debug.print("  Fibers vs Threads: {d:.1}x faster\n", .{@as(f64, @floatFromInt(thr_us)) / @as(f64, @floatFromInt(@max(fib_us, 1)))});
+
+    std.debug.print("\n  Memory per agent:\n", .{});
+    std.debug.print("    OS Thread: 8 MB stack\n", .{});
+    std.debug.print("    Fiber:    16 KB stack (512x less)\n", .{});
+
+    // === Independent tasks (no dependencies, separate files) ===
+    std.debug.print("\n=== Independent Tasks (pure parallel fan-out) ===\n", .{});
+    {
+        var indie_tasks: [256]Task = undefined;
+        for (0..256) |i| {
+            indie_tasks[i] = .{
+                .id = @intCast(i),
+                .kind = .transform,
+                .file_id = @intCast(i % 32),
+                .depends_on = null,
+            };
+        }
+
+        // Create files
+        for (0..32) |i| {
+            var p: [256]u8 = undefined;
+            const path = filePath(&p, @intCast(i));
+            const f = fs.cwd().createFile(path, .{}) catch continue;
+            defer f.close();
+            f.writeAll("hello world from file\n") catch continue;
+        }
+
+        std.debug.print("256 independent transform tasks across 32 files\n\n", .{});
+
+        std.debug.print("Sequential... ", .{});
+        const s_us = runSequentialBench(&indie_tasks, 256);
+        std.debug.print("{d}µs\n", .{s_us});
+
+        std.debug.print("OS Threads... ", .{});
+        const t_us = runThreadBench(&indie_tasks, 256);
+        std.debug.print("{d}µs\n", .{t_us});
+
+        std.debug.print("Fibers...     ", .{});
+        const f_us = runFiberBench(&indie_tasks, 256);
+        std.debug.print("{d}µs\n", .{f_us});
+
+        std.debug.print("\nResults:\n", .{});
+        std.debug.print("  Sequential:  {d}µs\n", .{s_us});
+        std.debug.print("  OS Threads:  {d}µs  ({d:.1}x vs seq)\n", .{ t_us, @as(f64, @floatFromInt(s_us)) / @as(f64, @floatFromInt(@max(t_us, 1))) });
+        std.debug.print("  Fibers:      {d}µs  ({d:.1}x vs seq)\n", .{ f_us, @as(f64, @floatFromInt(s_us)) / @as(f64, @floatFromInt(@max(f_us, 1))) });
+        std.debug.print("  Fibers vs Threads: {d:.1}x\n", .{@as(f64, @floatFromInt(t_us)) / @as(f64, @floatFromInt(@max(f_us, 1)))});
+    }
+
+    fs.cwd().deleteTree(WORKDIR) catch {};
+    std.debug.print("\n=== Done ===\n", .{});
+}

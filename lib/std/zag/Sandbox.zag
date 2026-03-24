@@ -1,0 +1,222 @@
+//! Sandbox — capability-based resource limits for fibers.
+//!
+//! Wraps a fiber with memory, time, I/O, and operation limits.
+//! The sandboxed code runs as a plain function — it gets a Sandbox
+//! context that provides restricted allocator and I/O.
+//!
+//! Usage:
+//!   var sb = Sandbox.init(.{
+//!       .memory_limit = 1 * 1024 * 1024,  // 1MB
+//!       .time_limit_ms = 5000,              // 5 seconds
+//!       .max_ops = 1000,
+//!       .allowed_paths = &.{ "/tmp/work", "/data/input" },
+//!   });
+//!   const result = sb.run(myToolFunction, .{ args });
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Fiber = @import("Fiber.zag");
+
+const Sandbox = @This();
+
+pub const Config = struct {
+    /// Maximum bytes the sandbox can allocate (0 = unlimited)
+    memory_limit: usize = 0,
+    /// Maximum wall-clock time in milliseconds (0 = unlimited)
+    time_limit_ms: u64 = 0,
+    /// Maximum number of operations (reads + writes + allocations) (0 = unlimited)
+    max_ops: u64 = 0,
+    /// Allowed filesystem path prefixes (empty = all allowed)
+    allowed_paths: []const []const u8 = &.{},
+    /// Whether network access is allowed
+    allow_network: bool = true,
+    /// Parent allocator to wrap
+    allocator: Allocator = std.heap.page_allocator,
+};
+
+config: Config,
+
+/// Runtime stats
+bytes_allocated: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+ops_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+start_time_ns: i128 = 0,
+violated: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+violation_reason: ?[]const u8 = null,
+
+pub fn init(config: Config) Sandbox {
+    return .{
+        .config = config,
+        .start_time_ns = std.time.nanoTimestamp(),
+    };
+}
+
+/// Check if an operation is allowed. Increments op counter.
+/// Returns error.SandboxViolation if limits exceeded.
+pub fn checkOp(self: *Sandbox) !void {
+    // Time check
+    if (self.config.time_limit_ms > 0) {
+        const elapsed_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - self.start_time_ns, 1_000_000));
+        if (elapsed_ms > self.config.time_limit_ms) {
+            self.violate("time limit exceeded");
+            return error.SandboxViolation;
+        }
+    }
+
+    // Op count check
+    if (self.config.max_ops > 0) {
+        const count = self.ops_count.fetchAdd(1, .monotonic);
+        if (count >= self.config.max_ops) {
+            self.violate("operation limit exceeded");
+            return error.SandboxViolation;
+        }
+    }
+
+    // Also check fiber cancellation
+    if (Fiber.getCurrentFiber()) |fiber| {
+        if (fiber.isCancelled()) {
+            return error.SandboxViolation;
+        }
+    }
+}
+
+/// Check if a path is allowed.
+pub fn checkPath(self: *Sandbox, path: []const u8) !void {
+    if (self.config.allowed_paths.len == 0) return; // no restrictions
+
+    for (self.config.allowed_paths) |allowed| {
+        if (std.mem.startsWith(u8, path, allowed)) return;
+    }
+
+    self.violate("path access denied");
+    return error.SandboxViolation;
+}
+
+/// Check if a memory allocation is allowed.
+pub fn checkAlloc(self: *Sandbox, bytes: usize) !void {
+    if (self.config.memory_limit == 0) return;
+
+    const current = self.bytes_allocated.load(.monotonic);
+    if (current + bytes > self.config.memory_limit) {
+        self.violate("memory limit exceeded");
+        return error.SandboxViolation;
+    }
+}
+
+/// Record a memory allocation.
+pub fn recordAlloc(self: *Sandbox, bytes: usize) void {
+    _ = self.bytes_allocated.fetchAdd(bytes, .monotonic);
+}
+
+/// Record a memory free.
+pub fn recordFree(self: *Sandbox, bytes: usize) void {
+    _ = self.bytes_allocated.fetchSub(bytes, .monotonic);
+}
+
+fn violate(self: *Sandbox, reason: []const u8) void {
+    if (!self.violated.load(.monotonic)) {
+        self.violated.store(true, .release);
+        self.violation_reason = reason;
+        // Cancel the fiber if running in one
+        if (Fiber.getCurrentFiber()) |fiber| {
+            fiber.cancel();
+        }
+    }
+}
+
+/// Get a sandboxed allocator that tracks and limits memory usage.
+pub fn getAllocator(self: *Sandbox) SandboxAllocator {
+    return .{ .sandbox = self };
+}
+
+pub fn isViolated(self: *const Sandbox) bool {
+    return self.violated.load(.acquire);
+}
+
+pub fn getViolationReason(self: *const Sandbox) ?[]const u8 {
+    return self.violation_reason;
+}
+
+pub fn getBytesAllocated(self: *const Sandbox) u64 {
+    return self.bytes_allocated.load(.monotonic);
+}
+
+pub fn getOpsCount(self: *const Sandbox) u64 {
+    return self.ops_count.load(.monotonic);
+}
+
+pub fn getElapsedMs(self: *const Sandbox) u64 {
+    return @intCast(@divTrunc(std.time.nanoTimestamp() - self.start_time_ns, 1_000_000));
+}
+
+/// Allocator that wraps the parent and enforces sandbox memory limits.
+pub const SandboxAllocator = struct {
+    sandbox: *Sandbox,
+
+    pub fn allocator(self: *SandboxAllocator) Allocator {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    const vtable = Allocator.VTable{
+        .alloc = sbAlloc,
+        .resize = sbResize,
+        .remap = sbRemap,
+        .free = sbFree,
+    };
+
+    fn sbAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *SandboxAllocator = @ptrCast(@alignCast(ctx));
+        self.sandbox.checkAlloc(len) catch return null;
+
+        const parent = self.sandbox.config.allocator;
+        const result = parent.rawAlloc(len, alignment, ret_addr);
+        if (result != null) {
+            self.sandbox.recordAlloc(len);
+        }
+        return result;
+    }
+
+    fn sbResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *SandboxAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) {
+            self.sandbox.checkAlloc(new_len - memory.len) catch return false;
+        }
+
+        const parent = self.sandbox.config.allocator;
+        const result = parent.rawResize(memory, alignment, new_len, ret_addr);
+        if (result) {
+            if (new_len > memory.len) {
+                self.sandbox.recordAlloc(new_len - memory.len);
+            } else {
+                self.sandbox.recordFree(memory.len - new_len);
+            }
+        }
+        return result;
+    }
+
+    fn sbRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *SandboxAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) {
+            self.sandbox.checkAlloc(new_len - memory.len) catch return null;
+        }
+        const parent = self.sandbox.config.allocator;
+        const result = parent.rawRemap(memory, alignment, new_len, ret_addr);
+        if (result != null) {
+            if (new_len > memory.len) {
+                self.sandbox.recordAlloc(new_len - memory.len);
+            } else {
+                self.sandbox.recordFree(memory.len - new_len);
+            }
+        }
+        return result;
+    }
+
+    fn sbFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *SandboxAllocator = @ptrCast(@alignCast(ctx));
+        self.sandbox.recordFree(memory.len);
+        const parent = self.sandbox.config.allocator;
+        parent.rawFree(memory, alignment, ret_addr);
+    }
+};

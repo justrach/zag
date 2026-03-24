@@ -1,0 +1,305 @@
+//! Scheduler — work-stealing thread pool for Zag fibers.
+//!
+//! Each worker thread has a local deque of fibers. When a worker's deque is
+//! empty, it steals from other workers. This gives good locality for related
+//! work while balancing load across cores.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
+const Fiber = @import("Fiber.zag");
+const EventLoop = @import("EventLoop.zag");
+const Thread = std.Thread;
+
+const Scheduler = @This();
+
+/// Worker thread state
+pub const Worker = struct {
+    /// Local fiber run queue (LIFO for locality)
+    local_queue: FiberQueue,
+    /// Thread handle (null for the main thread worker)
+    thread: ?Thread = null,
+    /// Worker index
+    id: usize,
+    /// Scheduler back-reference
+    scheduler: *Scheduler,
+    /// Scheduler context saved when switching to a fiber
+    sched_context: Fiber.Context = .{},
+    /// Per-worker kqueue event loop for fiber-aware I/O
+    event_loop: ?EventLoop = null,
+
+    pub fn init(id: usize, scheduler: *Scheduler) Worker {
+        return .{
+            .local_queue = FiberQueue.init(),
+            .id = id,
+            .scheduler = scheduler,
+            .event_loop = EventLoop.init() catch null,
+        };
+    }
+
+    /// Main worker loop: run fibers, poll I/O between runs.
+    pub fn run(self: *Worker) void {
+        // Set up thread-local scheduler context and event loop
+        Fiber.setSchedulerContext(&self.sched_context);
+        if (self.event_loop) |*el| EventLoop.setCurrent(el);
+
+        var ready_buf: [256]?*Fiber = undefined;
+
+        while (!self.scheduler.shutdown_flag.load(.acquire)) {
+            // 1. Poll kqueue for I/O-ready fibers (non-blocking)
+            if (self.event_loop) |*el| {
+                const n = el.poll(&ready_buf);
+                for (ready_buf[0..n]) |maybe_fiber| {
+                    if (maybe_fiber) |fiber| {
+                        self.scheduler.global_queue.push(fiber);
+                    }
+                }
+            }
+
+            // 2. Run next fiber
+            if (self.getNextFiber()) |fiber| {
+                self.runFiber(fiber);
+            } else {
+                // No runnable fibers — poll with timeout to wait for I/O
+                if (self.event_loop) |*el| {
+                    const n = el.pollWait(&ready_buf, 1); // 1ms
+                    for (ready_buf[0..n]) |maybe_fiber| {
+                        if (maybe_fiber) |fiber| {
+                            self.scheduler.global_queue.push(fiber);
+                        }
+                    }
+                } else {
+                    std.Thread.yield() catch {};
+                }
+            }
+        }
+
+        // Drain remaining fibers on shutdown
+        while (self.getNextFiber()) |fiber| {
+            self.runFiber(fiber);
+        }
+    }
+
+    /// Execute a single fiber until it yields or completes.
+    pub fn runFiber(self: *Worker, fiber: *Fiber) void {
+        fiber.state = .running;
+        Fiber.switchFromScheduler(fiber);
+
+        // Fiber has yielded or completed — handle post-switch
+        switch (fiber.state) {
+            .completed, .cancelled => {
+                // Notify scope if attached
+                if (fiber.scope) |scope_ptr| {
+                    const scope: *@import("Scope.zag") = @ptrCast(@alignCast(scope_ptr));
+                    scope.fiberCompleted(fiber);
+                } else {
+                    // No scope — decrement active count directly
+                    if (Scheduler.getGlobal()) |sched| {
+                        _ = sched.active_fibers.fetchSub(1, .release);
+                    }
+                }
+            },
+            .suspended => {
+                // Fiber yielded — push to global queue for fair scheduling
+                self.scheduler.global_queue.push(fiber);
+            },
+            .parked_io => {
+                // Fiber waiting on kqueue — do NOT re-enqueue.
+                // EventLoop.poll() will re-enqueue when I/O is ready.
+            },
+            else => {},
+        }
+    }
+
+    /// Get next fiber: try local queue first, then steal from others.
+    pub fn getNextFiber(self: *Worker) ?*Fiber {
+        // Try local queue first
+        if (self.local_queue.pop()) |fiber| return fiber;
+
+        // Try global queue
+        if (self.scheduler.global_queue.pop()) |fiber| return fiber;
+
+        // Try stealing from other workers
+        return self.trySteal();
+    }
+
+    /// Attempt to steal a fiber from another worker's local queue.
+    fn trySteal(self: *Worker) ?*Fiber {
+        const workers = self.scheduler.workers orelse return null;
+        const num_workers = workers.len;
+        if (num_workers <= 1) return null;
+
+        // Start stealing from a random worker
+        var victim = (self.id +% 1) % num_workers;
+        var attempts: usize = 0;
+
+        while (attempts < num_workers - 1) : (attempts += 1) {
+            if (victim != self.id) {
+                if (workers[victim].local_queue.steal()) |fiber| {
+                    return fiber;
+                }
+            }
+            victim = (victim +% 1) % num_workers;
+        }
+
+        return null;
+    }
+};
+
+/// Thread-safe bounded fiber queue using mutex + condition variable.
+/// Simple and correct — can be upgraded to lock-free Chase-Lev deque later.
+pub const FiberQueue = struct {
+    const capacity = 16384;
+
+    items: [capacity]?*Fiber = [_]?*Fiber{null} ** capacity,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn init() FiberQueue {
+        return .{};
+    }
+
+    pub fn push(self: *FiberQueue, fiber: *Fiber) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.count >= capacity) return; // drop if full
+        self.items[self.tail] = fiber;
+        self.tail = (self.tail + 1) % capacity;
+        self.count += 1;
+    }
+
+    pub fn pop(self: *FiberQueue) ?*Fiber {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.count == 0) return null;
+        const fiber = self.items[self.head];
+        self.items[self.head] = null;
+        self.head = (self.head + 1) % capacity;
+        self.count -= 1;
+        return fiber;
+    }
+
+    pub fn steal(self: *FiberQueue) ?*Fiber {
+        return self.pop();
+    }
+
+    pub fn len(self: *FiberQueue) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.count;
+    }
+};
+
+/// Scheduler fields
+allocator: Allocator,
+workers: ?[]Worker = null,
+global_queue: FiberQueue = FiberQueue.init(),
+shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+num_threads: usize,
+
+/// Active fiber count — used by Scope to wait for completion
+active_fibers: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+/// Initialize the scheduler with the given number of worker threads.
+/// Pass 0 to auto-detect (one per CPU core).
+/// Pass 1 for single-threaded mode (ZAG_THREADS=1).
+pub fn init(allocator: Allocator, num_threads: usize) !Scheduler {
+    const thread_count = if (num_threads == 0)
+        std.Thread.getCpuCount() catch 1
+    else
+        num_threads;
+
+    return Scheduler{
+        .allocator = allocator,
+        .num_threads = thread_count,
+    };
+}
+
+/// Start the worker threads.
+pub fn start(self: *Scheduler) !void {
+    self.workers = try self.allocator.alloc(Worker, self.num_threads);
+
+    for (self.workers.?, 0..) |*worker, i| {
+        worker.* = Worker.init(i, self);
+    }
+
+    // Start worker threads (skip index 0 — that's the calling thread)
+    for (self.workers.?[1..]) |*worker| {
+        worker.thread = try Thread.spawn(.{}, Worker.run, .{worker});
+    }
+}
+
+/// Submit a fiber to the scheduler's global queue.
+pub fn submit(self: *Scheduler, fiber: *Fiber) void {
+    _ = self.active_fibers.fetchAdd(1, .release);
+    self.global_queue.push(fiber);
+}
+
+/// Spawn a new fiber running the given function with args.
+pub fn spawn(self: *Scheduler, allocator: Allocator, comptime func: anytype, args: anytype) !*Fiber {
+    const fiber = try allocator.create(Fiber);
+    fiber.* = try Fiber.init(allocator, Fiber.default_stack_size);
+    fiber.setup(func, args);
+    self.submit(fiber);
+    return fiber;
+}
+
+/// Run the scheduler on the calling thread (worker 0) until shutdown.
+/// This is for the main thread to participate as a worker.
+pub fn runOnCallingThread(self: *Scheduler) void {
+    if (self.workers) |workers| {
+        workers[0].run();
+    }
+}
+
+/// Signal all workers to stop and wait for them to finish.
+pub fn shutdown(self: *Scheduler) void {
+    self.shutdown_flag.store(true, .release);
+
+    if (self.workers) |workers| {
+        for (workers[1..]) |*worker| {
+            if (worker.thread) |thread| {
+                thread.join();
+                worker.thread = null;
+            }
+        }
+        self.allocator.free(workers);
+        self.workers = null;
+    }
+}
+
+/// Convenience: run fibers until all are complete, then shut down.
+/// Good for batch/test usage.
+pub fn runUntilComplete(self: *Scheduler) void {
+    if (self.workers) |workers| {
+        // Run on calling thread's worker until no active fibers remain
+        Fiber.setSchedulerContext(&workers[0].sched_context);
+
+        while (self.active_fibers.load(.acquire) > 0) {
+            if (workers[0].getNextFiber()) |fiber| {
+                workers[0].runFiber(fiber);
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+    }
+}
+
+pub fn deinit(self: *Scheduler) void {
+    self.shutdown();
+}
+
+// --- Global scheduler instance ---
+
+var global_scheduler: ?*Scheduler = null;
+
+pub fn getGlobal() ?*Scheduler {
+    return global_scheduler;
+}
+
+pub fn setGlobal(sched: *Scheduler) void {
+    global_scheduler = sched;
+}
