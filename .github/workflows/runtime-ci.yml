@@ -1,0 +1,171 @@
+name: Runtime CI
+
+on:
+  push:
+    branches: [main, 'feature/18-*']
+    tags: ['zag-rt-*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    name: Runtime Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            zig_url: https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
+            zig_dir: zig-aarch64-macos-0.15.2
+          # Linux x86_64 disabled — x86_64 context switch asm needs red zone fix
+          # - os: ubuntu-24.04
+          #   zig_url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+          #   zig_dir: zig-x86_64-linux-0.15.2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Zig
+        run: |
+          curl -L "${{ matrix.zig_url }}" -o zig.tar.xz
+          tar -xf zig.tar.xz
+          echo "$PWD/${{ matrix.zig_dir }}" >> $GITHUB_PATH
+
+      - name: Verify Zig
+        run: zig version
+
+      - name: Build test runner
+        run: bash test/zag/build.sh run_test Debug
+
+      - name: Run basic tests
+        run: perl -e 'alarm 30; exec @ARGV' /tmp/zag_run_test
+
+      - name: Build stress tests
+        run: bash test/zag/build.sh stress_test Debug
+
+      - name: Run stress tests
+        run: perl -e 'alarm 60; exec @ARGV' /tmp/zag_stress_test
+
+      - name: Build feature tests
+        run: bash test/zag/build.sh feature_test Debug
+
+      - name: Run feature tests
+        run: perl -e 'alarm 60; exec @ARGV' /tmp/zag_feature_test
+
+      - name: Build sandbox tests
+        run: bash test/zag/build.sh sandbox_test Debug
+
+      - name: Run sandbox tests
+        run: perl -e 'alarm 30; exec @ARGV' /tmp/zag_sandbox_test
+
+      - name: Build agent benchmark
+        run: bash test/zag/build.sh agent_bench ReleaseFast
+
+      - name: Run agent benchmark
+        run: perl -e 'alarm 60; exec @ARGV' /tmp/zag_agent_bench
+
+  benchmark:
+    name: Benchmarks (macos-14)
+    runs-on: macos-14
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/zag-rt-')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Zig
+        run: |
+          curl -L https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz -o zig.tar.xz
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-aarch64-macos-0.15.2" >> $GITHUB_PATH
+
+      - name: Build HTTP server
+        run: bash test/zag/build.sh http_bench ReleaseFast
+
+      - name: HTTP benchmark
+        run: |
+          brew install wrk
+          /tmp/zag_http_bench &
+          sleep 2
+          curl -s http://127.0.0.1:8080/
+          echo
+          wrk -t4 -c200 -d10s http://127.0.0.1:8080/
+          pkill -f zag_http_bench || true
+
+      - name: Build orchestrator benchmark
+        run: bash test/zag/build.sh benchmarks/orchestrator ReleaseFast
+
+      - name: Run orchestrator benchmark
+        run: perl -e 'alarm 60; exec @ARGV' /tmp/zag_benchmarks_orchestrator
+
+      - name: Build async patterns benchmark
+        run: bash test/zag/build.sh benchmarks/async_patterns ReleaseFast
+
+      - name: Run async patterns benchmark
+        run: perl -e 'alarm 60; exec @ARGV' /tmp/zag_benchmarks_async_patterns
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-24.04
+    needs: [test, benchmark]
+    if: startsWith(github.ref, 'refs/tags/zag-rt-')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse tag info
+        id: tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Extract stage: gamma, alpha, beta, rc, or release
+          if echo "$TAG" | grep -q "gamma"; then
+            echo "stage=gamma" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          elif echo "$TAG" | grep -q "alpha"; then
+            echo "stage=alpha" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          elif echo "$TAG" | grep -q "beta"; then
+            echo "stage=beta" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          elif echo "$TAG" | grep -q "rc"; then
+            echo "stage=rc" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stage=release" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="## ${{ steps.tag.outputs.tag }}
+
+          Stage: **${{ steps.tag.outputs.stage }}**
+
+          ### What's included
+          - Fiber runtime: Fiber, Scope, Channel(T), Mutex, EventLoop, io, Sandbox
+          - All .zag source files
+          - Test suite: unit, stress, feature, sandbox, agent, benchmarks
+          - HTTP server benchmark
+          - Build script: \`test/zag/build.sh\`
+
+          ### Quick start
+          \`\`\`bash
+          git checkout ${{ steps.tag.outputs.tag }}
+          bash test/zag/build.sh run_test Debug && /tmp/zag_run_test
+          \`\`\`
+          "
+
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --notes "$NOTES" \
+            ${{ steps.tag.outputs.prerelease == 'true' && '--prerelease' || '' }}
